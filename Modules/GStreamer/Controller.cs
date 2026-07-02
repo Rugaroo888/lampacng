@@ -514,7 +514,7 @@ public class GStreamerController : BaseController
             playlist.Append("#EXT-X-TARGETDURATION:")
                     .Append(segmentSeconds)
                     .Append('\n');
-            playlist.AppendLine("#EXT-X-MEDIA-SEQUENCE:0");;
+            playlist.AppendLine("#EXT-X-MEDIA-SEQUENCE:0"); ;
 
             for (int i = 0; i < count; i++)
             {

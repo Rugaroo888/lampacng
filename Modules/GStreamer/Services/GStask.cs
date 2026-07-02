@@ -782,7 +782,7 @@ public class GStask
                             continue;
                         }
 
-                        nuint size = buffer.GetSize(); 
+                        nuint size = buffer.GetSize();
                         if (size == 0)
                             continue;
 
