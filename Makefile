@@ -50,47 +50,84 @@ NC     = \033[0m
 
 # ── Default target ─────────────────────────────────────────────────────────────
 .DEFAULT_GOAL := help
+.PHONY: all
+all: build ## Build the application (default target)
 
+.PHONY: test
+test: check ## Run all checks (alias for check)
 .PHONY: help
-help: ## Show this help
+help: _help-header _help-dotnet _help-docker _help-compose _help-helm _help-other _help-vars ## Show this help
+
+.PHONY: _help-header
+_help-header:
 	@echo ""
 	@echo "$(BLUE)Lampac NextGen$(NC)"
+
+.PHONY: _help-dotnet
+_help-dotnet:
 	@echo ""
 	@echo "$(BLUE)Dotnet targets:$(NC)"
 	@grep -E '^[a-zA-Z_-]+:.*?## .*$$' $(MAKEFILE_LIST) \
 		| grep -vE '^(docker|dev|up|down|logs|ps|helm|version)' \
 		| awk 'BEGIN {FS = ":.*?## "}; {printf "  $(GREEN)%-26s$(NC) %s\n", $$1, $$2}'
+
+.PHONY: _help-docker
+_help-docker:
 	@echo ""
 	@echo "$(BLUE)Docker build targets:$(NC)"
 	@grep -E '^docker[-a-zA-Z0-9_]*:.*?## .*$$' $(MAKEFILE_LIST) \
 		| awk 'BEGIN {FS = ":.*?## "}; {printf "  $(GREEN)%-26s$(NC) %s\n", $$1, $$2}'
+
+.PHONY: _help-compose
+_help-compose:
 	@echo ""
 	@echo "$(BLUE)Compose targets:$(NC)"
 	@grep -E '^(up|down|logs|ps|dev-up|dev-down|dev-logs|dev-ps|dev-setup):.*?## .*$$' $(MAKEFILE_LIST) \
 		| awk 'BEGIN {FS = ":.*?## "}; {printf "  $(GREEN)%-26s$(NC) %s\n", $$1, $$2}'
+
+.PHONY: _help-helm
+_help-helm:
 	@echo ""
 	@echo "$(BLUE)Helm targets:$(NC)"
 	@grep -E '^helm[-a-zA-Z0-9_]*:.*?## .*$$' $(MAKEFILE_LIST) \
 		| awk 'BEGIN {FS = ":.*?## "}; {printf "  $(GREEN)%-26s$(NC) %s\n", $$1, $$2}'
+
+.PHONY: _help-other
+_help-other:
 	@echo ""
 	@echo "$(BLUE)Other targets:$(NC)"
 	@grep -E '^(version|check):.*?## .*$$' $(MAKEFILE_LIST) \
 		| awk 'BEGIN {FS = ":.*?## "}; {printf "  $(GREEN)%-26s$(NC) %s\n", $$1, $$2}'
+
+.PHONY: _help-vars
+_help-vars: _help-vars-dotnet _help-vars-compose _help-vars-helm
+
+.PHONY: _help-vars-dotnet
+_help-vars-dotnet:
 	@echo ""
 	@echo "$(BLUE)Variables (override with VAR=value):$(NC)"
 	@echo "  $(YELLOW)OUTPUT$(NC)=$(OUTPUT)        publish output directory"
 	@echo "  $(YELLOW)CONFIG$(NC)=$(CONFIG)       build configuration (Debug|Release)"
 	@echo "  $(YELLOW)RUNTIME_ID$(NC)=            dotnet runtime identifier (e.g. linux-x64)"
+
+.PHONY: _help-vars-docker
+_help-vars-docker:
 	@echo "  $(YELLOW)IMAGE_NAME$(NC)=$(IMAGE_NAME)"
 	@echo "  $(YELLOW)TAG$(NC)=$(TAG)         image tag"
 	@echo "  $(YELLOW)PUSH$(NC)=$(PUSH)        push image after build (true|false)"
 	@echo "  $(YELLOW)NO_CACHE$(NC)=$(NO_CACHE)    disable Docker build cache (true|false)"
 	@echo "  $(YELLOW)EXPORT_TAR$(NC)=          export single-platform image to tar path"
+
+.PHONY: _help-vars-compose
+_help-vars-compose: _help-vars-docker
 	@echo "  $(YELLOW)PLATFORM$(NC)=            override target platform (e.g. linux/amd64)"
 	@echo ""
 	@echo "$(BLUE)Compose variables:$(NC)"
 	@echo "  $(YELLOW)COMPOSE_FILE$(NC)=$(COMPOSE_FILE)"
 	@echo "  $(YELLOW)COMPOSE_DEV_FILE$(NC)=$(COMPOSE_DEV_FILE)"
+
+.PHONY: _help-vars-helm
+_help-vars-helm:
 	@echo ""
 	@echo "$(BLUE)Helm variables:$(NC)"
 	@echo "  $(YELLOW)HELM_RELEASE$(NC)=$(HELM_RELEASE)"
@@ -177,25 +214,35 @@ ps: ## Show status of production compose services
 # ── Docker Compose — dev (docker-compose.dev.yaml) ────────────────────────────
 
 .PHONY: dev-setup
-dev-setup: ## Create dev host dirs and copy example config (run once before dev-up)
+dev-setup: _dev-setup-dirs _dev-setup-config _dev-setup-plugins _dev-setup-passwd ## Create dev host dirs and copy example config
+	@echo "$(GREEN)[✓]$(NC) Dev setup complete. Run 'make dev-up' when ready."
+
+.PHONY: _dev-setup-dirs
+_dev-setup-dirs:
 	@echo "$(BLUE)[•]$(NC) Creating lampac-docker/config and lampac-docker/plugins..."
 	@mkdir -p lampac-docker/config lampac-docker/plugins
-	@if [ ! -f lampac-docker/config/development.init.conf ]; then \
-		cp config/example.init.conf lampac-docker/config/development.init.conf; \
-		echo "$(GREEN)[✓]$(NC) Copied config/example.init.conf → lampac-docker/config/development.init.conf"; \
-		echo "$(YELLOW)[!]$(NC) Edit lampac-docker/config/development.init.conf (set listen.port=29118 for dev)"; \
-	else \
-		echo "$(YELLOW)[!]$(NC) lampac-docker/config/development.init.conf already exists — skipping copy"; \
-	fi
+
+.PHONY: _dev-setup-config
+_dev-setup-config:
+	@[ -f lampac-docker/config/development.init.conf ] \
+		&& echo "$(YELLOW)[!]$(NC) lampac-docker/config/development.init.conf already exists — skipping copy" \
+		|| { cp config/example.init.conf lampac-docker/config/development.init.conf; \
+		     echo "$(GREEN)[✓]$(NC) Copied config/example.init.conf → lampac-docker/config/development.init.conf"; \
+		     echo "$(YELLOW)[!]$(NC) Edit lampac-docker/config/development.init.conf (set listen.port=29118 for dev)"; }
+
+.PHONY: _dev-setup-plugins
+_dev-setup-plugins:
 	@if [ ! -f lampac-docker/plugins/lampainit.js ]; then \
 		touch lampac-docker/plugins/lampainit.js; \
 		echo "$(GREEN)[✓]$(NC) Created empty lampac-docker/plugins/lampainit.js"; \
 	fi
+
+.PHONY: _dev-setup-passwd
+_dev-setup-passwd:
 	@if [ ! -f lampac-docker/config/passwd ]; then \
 		echo "$(YELLOW)[!]$(NC) lampac-docker/config/passwd missing."; \
 		echo "    Create it with: printf '%s' 'your_password' > lampac-docker/config/passwd"; \
 	fi
-	@echo "$(GREEN)[✓]$(NC) Dev setup complete. Run 'make dev-up' when ready."
 
 .PHONY: dev-up
 dev-up: ## Start dev compose stack (docker-compose.dev.yaml) in the background
@@ -218,50 +265,33 @@ dev-ps: ## Show status of dev compose services
 # ══════════════════════════════════════════════════════════════════════════════
 
 .PHONY: docker-build
-docker-build: _docker-check ## Build image for the current platform and load into Docker
-	$(eval _PLATFORM := $(if $(PLATFORM),$(PLATFORM),$(shell \
-		arch=$$(uname -m); \
-		case $$arch in \
-			x86_64)  echo linux/amd64 ;; \
-			arm64|aarch64) echo linux/arm64 ;; \
-			*) echo "Unsupported arch: $$arch" >&2; exit 1 ;; \
-		esac)))
-	@echo "$(BLUE)[•]$(NC) Building $(FULL_IMAGE) [$$_PLATFORM]"
-	docker buildx build \
-		--platform $(_PLATFORM) \
-		--tag $(FULL_IMAGE) \
-		--file Dockerfile \
-		--load \
-		$(NO_CACHE_FLAG) \
-		.
+docker-build: _docker-check _docker-detect-platform ## Build image for the current platform and load into Docker
+	docker buildx build --platform $(DETECTED_PLATFORM) --tag $(FULL_IMAGE) --file Dockerfile --load $(NO_CACHE_FLAG) .
 	@echo "$(GREEN)[✓]$(NC) Build complete: $(FULL_IMAGE)"
 	@docker images $(IMAGE_NAME):$(TAG) --format '  {{.Repository}}:{{.Tag}} — {{.Size}}'
 
+.PHONY: _docker-detect-platform
+_docker-detect-platform:
+	$(eval DETECTED_PLATFORM := $(if $(PLATFORM),$(PLATFORM),$(shell arch=$$(uname -m); case $$arch in x86_64) echo linux/amd64 ;; arm64|aarch64) echo linux/arm64 ;; *) echo "Unsupported arch: $$arch" >&2; exit 1 ;; esac)))
+	@echo "$(BLUE)[•]$(NC) Building $(FULL_IMAGE) [$(DETECTED_PLATFORM)]"
+
 .PHONY: docker-build-amd64
-docker-build-amd64: _docker-check _docker-setup-builder ## Build linux/amd64 image and load into Docker (useful on Apple Silicon)
+docker-build-amd64: _docker-check _docker-setup-builder _docker-build-amd64-task ## Build linux/amd64 image and load into Docker
+
+.PHONY: _docker-build-amd64-task
+_docker-build-amd64-task:
 	@echo "$(BLUE)[•]$(NC) Building $(FULL_IMAGE) [linux/amd64]"
-	docker buildx build \
-		--builder $(BUILDER_NAME) \
-		--platform linux/amd64 \
-		--tag $(FULL_IMAGE) \
-		--file Dockerfile \
-		--load \
-		$(NO_CACHE_FLAG) \
-		.
+	docker buildx build --builder $(BUILDER_NAME) --platform linux/amd64 --tag $(FULL_IMAGE) --file Dockerfile --load $(NO_CACHE_FLAG) .
 	@echo "$(GREEN)[✓]$(NC) Build complete: $(FULL_IMAGE)"
 	@docker images $(IMAGE_NAME):$(TAG) --format '  {{.Repository}}:{{.Tag}} — {{.Size}}'
 
 .PHONY: docker-build-arm64
-docker-build-arm64: _docker-check _docker-setup-builder ## Build linux/arm64 image and load into Docker
+docker-build-arm64: _docker-check _docker-setup-builder _docker-build-arm64-task ## Build linux/arm64 image and load into Docker
+
+.PHONY: _docker-build-arm64-task
+_docker-build-arm64-task:
 	@echo "$(BLUE)[•]$(NC) Building $(FULL_IMAGE) [linux/arm64]"
-	docker buildx build \
-		--builder $(BUILDER_NAME) \
-		--platform linux/arm64 \
-		--tag $(FULL_IMAGE) \
-		--file Dockerfile \
-		--load \
-		$(NO_CACHE_FLAG) \
-		.
+	docker buildx build --builder $(BUILDER_NAME) --platform linux/arm64 --tag $(FULL_IMAGE) --file Dockerfile --load $(NO_CACHE_FLAG) .
 	@echo "$(GREEN)[✓]$(NC) Build complete: $(FULL_IMAGE)"
 	@docker images $(IMAGE_NAME):$(TAG) --format '  {{.Repository}}:{{.Tag}} — {{.Size}}'
 
@@ -325,32 +355,33 @@ endif
 	@ls -lh $(EXPORT_TAR)
 
 .PHONY: docker-clean-cache
-docker-clean-cache: _docker-check ## Clean buildx cache for the lampac-builder builder
+docker-clean-cache: _docker-check _docker-cache-show-before _docker-cache-prune _docker-cache-show-after ## Clean buildx cache
+
+.PHONY: _docker-cache-show-before
+_docker-cache-show-before:
 	@echo "$(BLUE)[•]$(NC) Builder cache before cleanup:"
 	@docker buildx du --builder $(BUILDER_NAME) 2>/dev/null || true
+
+.PHONY: _docker-cache-prune
+_docker-cache-prune:
 	@echo ""
 	docker buildx prune --builder $(BUILDER_NAME) --force
 	@echo "$(GREEN)[✓]$(NC) Builder $(BUILDER_NAME) cache cleared"
+
+.PHONY: _docker-cache-show-after
+_docker-cache-show-after:
 	@echo ""
 	@echo "$(BLUE)[•]$(NC) Cache after cleanup:"
 	@docker system df 2>/dev/null || true
 
 .PHONY: docker-clean-cache-all
-docker-clean-cache-all: _docker-check ## Clean ALL Docker build caches (prompts for confirmation)
+docker-clean-cache-all: _docker-check _docker-clean-cache-all-confirm _docker-cache-show-after ## Clean ALL Docker build caches
+
+.PHONY: _docker-clean-cache-all-confirm
+_docker-clean-cache-all-confirm:
 	@echo ""
 	@echo "$(YELLOW)[!]$(NC) This will remove ALL Docker build cache (all builders, all projects)"
-	@read -r -p "Are you sure? [y/N] " confirm; \
-	echo ""; \
-	if [ "$$confirm" = "y" ] || [ "$$confirm" = "Y" ]; then \
-		docker buildx prune --all --force; \
-		docker builder prune --force 2>/dev/null || true; \
-		echo "$(GREEN)[✓]$(NC) All Docker build cache cleared"; \
-	else \
-		echo "$(YELLOW)[!]$(NC) Skipped"; \
-	fi
-	@echo ""
-	@echo "$(BLUE)[•]$(NC) Cache after cleanup:"
-	@docker system df 2>/dev/null || true
+	@read -r -p "Are you sure? [y/N] " confirm; echo ""; if [ "$$confirm" = "y" ] || [ "$$confirm" = "Y" ]; then docker buildx prune --all --force; docker builder prune --force 2>/dev/null || true; echo "$(GREEN)[✓]$(NC) All Docker build cache cleared"; else echo "$(YELLOW)[!]$(NC) Skipped"; fi
 
 .PHONY: docker-rm-builder
 docker-rm-builder: ## Remove the lampac-builder buildx builder
@@ -390,25 +421,27 @@ helm-dry-run: ## Dry-run helm upgrade --install (validates against a live cluste
 # ══════════════════════════════════════════════════════════════════════════════
 
 .PHONY: _docker-check
-_docker-check:
-	@command -v docker >/dev/null 2>&1 \
-		|| (echo "$(RED)[✗]$(NC) Docker is not installed." >&2; exit 1)
-	@docker info >/dev/null 2>&1 \
-		|| (echo "$(RED)[✗]$(NC) Docker daemon is not running. Start Docker Desktop." >&2; exit 1)
-	@docker buildx version >/dev/null 2>&1 \
-		|| (echo "$(RED)[✗]$(NC) Docker Buildx is not available. Update Docker Desktop." >&2; exit 1)
+_docker-check: _docker-check-cmd _docker-check-daemon _docker-check-buildx
+
+.PHONY: _docker-check-cmd
+_docker-check-cmd:
+	@command -v docker >/dev/null 2>&1 || (echo "$(RED)[✗]$(NC) Docker is not installed." >&2; exit 1)
+
+.PHONY: _docker-check-daemon
+_docker-check-daemon:
+	@docker info >/dev/null 2>&1 || (echo "$(RED)[✗]$(NC) Docker daemon is not running. Start Docker Desktop." >&2; exit 1)
+
+.PHONY: _docker-check-buildx
+_docker-check-buildx:
+	@docker buildx version >/dev/null 2>&1 || (echo "$(RED)[✗]$(NC) Docker Buildx is not available. Update Docker Desktop." >&2; exit 1)
 
 .PHONY: _docker-setup-builder
-_docker-setup-builder:
-	@if docker buildx inspect $(BUILDER_NAME) >/dev/null 2>&1; then \
-		echo "$(YELLOW)[!]$(NC) Builder '$(BUILDER_NAME)' already exists — reusing"; \
-	else \
-		echo "$(BLUE)[•]$(NC) Creating buildx builder '$(BUILDER_NAME)'..."; \
-		docker buildx create \
-			--name $(BUILDER_NAME) \
-			--driver docker-container \
-			--platform $(ALL_PLATFORMS) \
-			--bootstrap; \
-		echo "$(GREEN)[✓]$(NC) Builder '$(BUILDER_NAME)' created"; \
-	fi
+_docker-setup-builder: _docker-setup-builder-check _docker-setup-builder-use
+
+.PHONY: _docker-setup-builder-check
+_docker-setup-builder-check:
+	@if docker buildx inspect $(BUILDER_NAME) >/dev/null 2>&1; then echo "$(YELLOW)[!]$(NC) Builder '$(BUILDER_NAME)' already exists — reusing"; else echo "$(BLUE)[•]$(NC) Creating buildx builder '$(BUILDER_NAME)'..."; docker buildx create --name $(BUILDER_NAME) --driver docker-container --platform $(ALL_PLATFORMS) --bootstrap; echo "$(GREEN)[✓]$(NC) Builder '$(BUILDER_NAME)' created"; fi
+
+.PHONY: _docker-setup-builder-use
+_docker-setup-builder-use:
 	@docker buildx use $(BUILDER_NAME)
