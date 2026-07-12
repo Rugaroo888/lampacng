@@ -8,11 +8,37 @@ using System.IO;
 
 namespace GStreamer;
 
-public readonly record struct Segment(
-    RecyclableMemoryStream data,
-    ulong startNs,
-    ulong endNs
-);
+public readonly struct Segment
+{
+    readonly Action<Stream> _writeTo;
+
+    public readonly long length;
+    public readonly ulong startNs;
+    public readonly ulong endNs;
+
+    internal Segment(
+        long length,
+        ulong startNs,
+        ulong endNs,
+        Action<Stream> writeTo
+    )
+    {
+        this.length = length;
+        this.startNs = startNs;
+        this.endNs = endNs;
+        _writeTo = writeTo ?? throw new ArgumentNullException(nameof(writeTo));
+    }
+
+    public void WriteTo(Stream output)
+    {
+        ArgumentNullException.ThrowIfNull(output);
+
+        if (_writeTo == null)
+            throw new InvalidOperationException("Segment writer is not initialized.");
+
+        _writeTo(output);
+    }
+}
 
 /// <summary>
 /// Собирает отдельные однодорожечные fragments mp4mux в один HLS fMP4 segment:
@@ -90,7 +116,6 @@ public sealed class Mp4BoxReader : IDisposable
 
     RecyclableMemoryStream _sourcePayload;
     RecyclableMemoryStream _prefix;
-    RecyclableMemoryStream _segment;
 
     Fragment _pending;
     byte[] _styp;
@@ -218,12 +243,6 @@ public sealed class Mp4BoxReader : IDisposable
         _segmentDiff = segmentDiff;
     }
 
-    public void ResetSegment()
-    {
-        _segment?.Dispose();
-        _segment = null;
-    }
-
     public void SeekReset()
     {
         SeekReset(0UL);
@@ -254,7 +273,6 @@ public sealed class Mp4BoxReader : IDisposable
         ClearFragments(_audio);
         ResetPrefix();
         ResetBox();
-        ResetSegment();
     }
 
     public void SetTimelineOffsetNs(ulong offsetNs)
@@ -1287,51 +1305,6 @@ public sealed class Mp4BoxReader : IDisposable
                 ? 8
                 : 16;
 
-        ResetSegment();
-        _segment = PoolInvk.msm.GetStream();
-
-        if (_styp != null)
-            _segment.Write(_styp);
-
-        Append(_prefix, _segment);
-
-        WriteHeader(_segment, moofSize, BoxMoof);
-        WriteMfhd(_segment, _sequence++);
-
-        if (hasVideo)
-        {
-            WriteTraf(
-                _segment,
-                _video,
-                videoCount,
-                moofSize,
-                mdatHeaderSize
-            );
-        }
-
-        if (hasAudio)
-        {
-            WriteTraf(
-                _segment,
-                _audio,
-                audioCount,
-                moofSize,
-                mdatHeaderSize
-            );
-        }
-
-        WriteMdatHeader(
-            _segment,
-            checked((ulong)payloadLength),
-            mdatHeaderSize
-        );
-
-        if (hasVideo)
-            AppendPayloads(_video, videoCount, _segment);
-
-        if (hasAudio)
-            AppendPayloads(_audio, audioCount, _segment);
-
         Fragment first = hasVideo
             ? _video[0]
             : _audio[0];
@@ -1340,22 +1313,87 @@ public sealed class Mp4BoxReader : IDisposable
             ? _video[videoCount - 1]
             : _audio[audioCount - 1];
 
-        _segment.Position = 0;
+        byte[] styp = _styp;
+        RecyclableMemoryStream prefix = _prefix;
+        uint sequence = _sequence++;
+        ulong tfdtOffsetNs = _tfdtOffsetNs;
 
-        var output = _segment;
-        _segment = null;
+        long segmentLength = checked(
+            (long)(styp?.Length ?? 0) +
+            (prefix?.Length ?? 0L) +
+            moofSize +
+            mdatHeaderSize +
+            payloadLength
+        );
+
+        bool writerActive = true;
+
+        void WriteSegment(Stream output)
+        {
+            if (!writerActive)
+            {
+                throw new InvalidOperationException(
+                    "Segment writer can only be used during the segment callback."
+                );
+            }
+
+            if (styp != null)
+                output.Write(styp);
+
+            Append(prefix, output);
+
+            WriteHeader(output, moofSize, BoxMoof);
+            WriteMfhd(output, sequence);
+
+            if (hasVideo)
+            {
+                WriteTraf(
+                    output,
+                    _video,
+                    videoCount,
+                    moofSize,
+                    mdatHeaderSize,
+                    tfdtOffsetNs
+                );
+            }
+
+            if (hasAudio)
+            {
+                WriteTraf(
+                    output,
+                    _audio,
+                    audioCount,
+                    moofSize,
+                    mdatHeaderSize,
+                    tfdtOffsetNs
+                );
+            }
+
+            WriteMdatHeader(
+                output,
+                checked((ulong)payloadLength),
+                mdatHeaderSize
+            );
+
+            if (hasVideo)
+                AppendPayloads(_video, videoCount, output);
+
+            if (hasAudio)
+                AppendPayloads(_audio, audioCount, output);
+        }
 
         try
         {
             _onSegment(new Segment(
-                output,
+                segmentLength,
                 AddClockTime(_tfdtOffsetNs, ToNanoseconds(first.DecodeTime, first.Timescale)),
-                AddClockTime(_tfdtOffsetNs, ToNanoseconds(last.EndTime, last.Timescale))
+                AddClockTime(_tfdtOffsetNs, ToNanoseconds(last.EndTime, last.Timescale)),
+                WriteSegment
             ));
         }
         finally
         {
-            output.Dispose();
+            writerActive = false;
         }
 
         if (hasVideo)
@@ -1431,12 +1469,13 @@ public sealed class Mp4BoxReader : IDisposable
         return checked(20L + (long)run.SampleCount * fieldsPerSample * 4L);
     }
 
-    void WriteTraf(
+    static void WriteTraf(
         Stream output,
         List<Fragment> fragments,
         int count,
         uint moofSize,
-        int mdatHeaderSize
+        int mdatHeaderSize,
+        ulong tfdtOffsetNs
     )
     {
         long size64 = GetTrafSize(fragments, count);
@@ -1451,7 +1490,7 @@ public sealed class Mp4BoxReader : IDisposable
 
         WriteTfdt(
             output,
-            AddTfdtOffset(first.DecodeTime, first.Timescale, _tfdtOffsetNs)
+            AddTfdtOffset(first.DecodeTime, first.Timescale, tfdtOffsetNs)
         );
 
         for (int i = 0; i < count; i++)
@@ -2785,7 +2824,6 @@ public sealed class Mp4BoxReader : IDisposable
 
     public void Dispose()
     {
-        ResetSegment();
         ResetPrefix();
         ClearSource();
         ClearFragments(_video);

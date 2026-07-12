@@ -41,6 +41,7 @@ http://IP:9118/gst.js
 | `hdr_to_sdr` | `false` | Запросить HDR-to-SDR tone mapping только для обнаруженного HDR-видео. |
 | `hardwareAcceleration` | `true` | Использовать проверенный при старте аппаратный H.264 encoder; при `false` используется `x264enc`. |
 | `useGpu` | `true` | Использовать добавленные модулем GPU-бэкенды и выполнять их стартовые проверки; при `false` используются `x264enc` и CPU HDR tone mapping. На автоматический выбор декодера самим GStreamer не влияет. |
+| `x264Ultrafast` | `false` | Использовать `speed-preset=ultrafast` вместо `veryfast` в software-ветке `x264enc`. Снижает нагрузку CPU ценой эффективности сжатия. На аппаратные encoder не влияет. |
 
 Полный пример:
 
@@ -70,12 +71,13 @@ http://IP:9118/gst.js
   "transcodeAVI": false,
   "hdr_to_sdr": false,
   "hardwareAcceleration": true,
-  "useGpu": true
+  "useGpu": true,
+  "x264Ultrafast": false
 }
 ```
 
 В этом примере H.264, H.265, AV1 и VP9 передаётся без перекодирования. Доступ разрешён только двум указанным UID.
-`hardwareAcceleration` применяется только когда видео действительно перекодируется. `useGpu: false` не запрещает самому GStreamer выбрать аппаратный декодер.
+`hardwareAcceleration` применяется только когда видео действительно перекодируется. `useGpu: false` не запрещает самому GStreamer выбрать аппаратный декодер. `x264Ultrafast` применяется только при фактическом использовании `x264enc`, включая fallback после недоступного аппаратного encoder.
 
 ### Настройки для отдельных UID
 

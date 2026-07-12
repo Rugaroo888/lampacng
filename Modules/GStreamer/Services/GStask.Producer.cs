@@ -15,6 +15,7 @@ public partial class GStask
     bool activeSegmentStoreFailed;
 
     int prefetchRunning;
+    int prefetchRequested;
     int prefetchGeneration;
     CancellationTokenSource prefetchCts;
 
@@ -408,8 +409,6 @@ public partial class GStask
                 readGeneration = Volatile.Read(ref pipelineGeneration);
             }
 
-            mp4Reader.ResetSegment();
-
             activeSegmentIndex = segmentIndex;
             activeSegmentStoreFailed = false;
             segmentReadStarted = true;
@@ -642,7 +641,10 @@ public partial class GStask
             return;
 
         if (Interlocked.CompareExchange(ref prefetchRunning, 1, 0) != 0)
+        {
+            Volatile.Write(ref prefetchRequested, 1);
             return;
+        }
 
         var cts = new CancellationTokenSource();
 
@@ -690,14 +692,16 @@ public partial class GStask
                 cts.Dispose();
 
                 Volatile.Write(ref prefetchRunning, 0);
+                bool restartRequested = Interlocked.Exchange(ref prefetchRequested, 0) != 0;
 
                 int latestClientIndex = ClientSegmentIndex();
+                bool sameGeneration = Volatile.Read(ref prefetchGeneration) == generation;
 
-                if (!canceled &&
-                    latestClientIndex > startedFrom &&
+                if ((restartRequested ||
+                     !canceled && latestClientIndex > startedFrom && sameGeneration) &&
                     !IsDead &&
                     !IsEos &&
-                    Volatile.Read(ref prefetchGeneration) == generation &&
+                    !IsFrozen &&
                     NeedsSegmentPrefetch(latestClientIndex))
                 {
                     QueueSegmentPrefetch(latestClientIndex);
@@ -711,6 +715,7 @@ public partial class GStask
     public void CancelSegmentPrefetch()
     {
         Interlocked.Increment(ref prefetchGeneration);
+        Volatile.Write(ref prefetchRequested, 0);
 
         try
         {

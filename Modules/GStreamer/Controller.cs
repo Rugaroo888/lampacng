@@ -263,12 +263,20 @@ public class GStreamerController : BaseController
         if (gstask == null)
             return NotFound();
 
-        int duration = gstask.probe.DurationSeconds;
-        if (0 >= duration)
-            duration = 200 * 60; // 200 min
+        const long secondNs = 1_000_000_000L;
 
-        int segmentSeconds = gstask.conf.segment_seconds;
-        int count = duration / segmentSeconds;
+        long durationNs = gstask.probe.DurationNs;
+        if (durationNs <= 0)
+            durationNs = 200L * 60L * secondNs; // 200 min
+
+        int segmentSeconds = Math.Max(1, gstask.conf.segment_seconds);
+        long segmentNs = checked((long)segmentSeconds * secondNs);
+        long count64 = durationNs / segmentNs;
+
+        if (durationNs % segmentNs != 0)
+            count64++;
+
+        int count = checked((int)count64);
 
         var playlist = StringBuilderPool.Rent();
 
@@ -287,10 +295,19 @@ public class GStreamerController : BaseController
 
             for (int i = 0; i < count; i++)
             {
+                long itemDurationNs = i + 1 == count
+                    ? durationNs - (long)i * segmentNs
+                    : segmentNs;
+
                 playlist
                     .Append("#EXTINF:")
-                    .Append(segmentSeconds)
-                    .AppendLine(".00,");
+                    .Append(
+                        ((double)itemDurationNs / secondNs).ToString(
+                            "0.###",
+                            System.Globalization.CultureInfo.InvariantCulture
+                        )
+                    )
+                    .AppendLine(",");
 
                 playlist
                     .Append("seg/")
@@ -362,10 +379,9 @@ public class GStreamerController : BaseController
                 }
             }
 
-            gstask.SetClientSegmentIndex(index);
-
             if (gstask.TryOpenSegmentFile(index, out var cachedSegment))
             {
+                gstask.SetClientSegmentIndex(index, cacheHit: true);
                 gstask.QueueSegmentPrefetch(index);
 
                 await SendSegmentFile(
@@ -375,6 +391,7 @@ public class GStreamerController : BaseController
             }
             else
             {
+                gstask.SetClientSegmentIndex(index, cacheHit: false);
                 gstask.CancelSegmentPrefetch();
 
                 try
@@ -448,12 +465,20 @@ public class GStreamerController : BaseController
         if (gstask == null)
             return NotFound();
 
-        int duration = gstask.probe.DurationSeconds;
-        if (0 >= duration)
-            duration = 200 * 60; // 200 min
+        const long secondNs = 1_000_000_000L;
 
-        int segmentSeconds = gstask.conf.segment_seconds;
-        int count = duration / segmentSeconds;
+        long durationNs = gstask.probe.DurationNs;
+        if (durationNs <= 0)
+            durationNs = 200L * 60L * secondNs; // 200 min
+
+        int segmentSeconds = Math.Max(1, gstask.conf.segment_seconds);
+        long segmentNs = checked((long)segmentSeconds * secondNs);
+        long count64 = durationNs / segmentNs;
+
+        if (durationNs % segmentNs != 0)
+            count64++;
+
+        int count = checked((int)count64);
 
         var playlist = StringBuilderPool.Rent();
 
@@ -469,10 +494,19 @@ public class GStreamerController : BaseController
 
             for (int i = 0; i < count; i++)
             {
+                long itemDurationNs = i + 1 == count
+                    ? durationNs - (long)i * segmentNs
+                    : segmentNs;
+
                 playlist
                     .Append("#EXTINF:")
-                    .Append(segmentSeconds)
-                    .AppendLine(".00,");
+                    .Append(
+                        ((double)itemDurationNs / secondNs).ToString(
+                            "0.###",
+                            System.Globalization.CultureInfo.InvariantCulture
+                        )
+                    )
+                    .AppendLine(",");
 
                 playlist
                     .Append(index)

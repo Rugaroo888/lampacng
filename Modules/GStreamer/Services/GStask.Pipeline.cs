@@ -161,6 +161,7 @@ public partial class GStask
         if (encoderPipeline == null)
         {
             string videoConverter = toneMapHdr ? string.Empty : "videoconvert !";
+            string x264SpeedPreset = conf.x264Ultrafast ? "ultrafast" : "veryfast";
 
             encoderPipeline = $$"""
             {{videoConverter}}
@@ -169,7 +170,7 @@ public partial class GStask
             x264enc
                 name=video_encoder
                 tune=zerolatency
-                speed-preset=veryfast
+                speed-preset={{x264SpeedPreset}}
                 bitrate={{conf.video_bitrate}}
                 key-int-max={{keyIntMax}}
                 bframes=0

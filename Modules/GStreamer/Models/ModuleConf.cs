@@ -88,6 +88,9 @@ public class ModuleConf : ModuleBaseConf
     /// <summary>Enable GPU backends added by this module. GStreamer decodebin remains automatic.</summary>
     public bool useGpu { get; set; } = true;
 
+    /// <summary>Use the x264 ultrafast preset instead of veryfast for software encoding.</summary>
+    public bool x264Ultrafast { get; set; }
+
     /// <summary>
     /// 14 Мбит/c
     /// </summary>
