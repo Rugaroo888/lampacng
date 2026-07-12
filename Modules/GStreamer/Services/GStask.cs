@@ -95,28 +95,21 @@ public partial class GStask
     #region OnSegmentReady
     void OnSegmentReady(Segment segment)
     {
-        try
+        if (segment.startNs > 0)
+            Volatile.Write(ref positionSeconds, segment.startNs);
+
+        int index = activeSegmentIndex;
+        if (index < 0)
+            return;
+
+        if (!StoreSegmentFile(index, segment))
         {
-            if (segment.startNs > 0)
-                Volatile.Write(ref positionSeconds, segment.startNs);
-
-            int index = activeSegmentIndex;
-            if (index < 0)
-                return;
-
-            if (!StoreSegmentFile(index, segment))
-            {
-                activeSegmentStoreFailed = true;
-            }
-            else
-            {
-                segmentStartNsByIndex[index] = segment.startNs;
-                Volatile.Write(ref readerSegmentIndex, index);
-            }
+            activeSegmentStoreFailed = true;
         }
-        finally
+        else
         {
-            mp4Reader.ResetSegment();
+            segmentStartNsByIndex[index] = segment.startNs;
+            Volatile.Write(ref readerSegmentIndex, index);
         }
     }
     #endregion

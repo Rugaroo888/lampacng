@@ -1,6 +1,7 @@
 ﻿using Microsoft.IO;
 using Shared.Services.Pools;
 using System;
+using System.Buffers;
 using System.Buffers.Binary;
 using System.Collections.Generic;
 using System.IO;
@@ -1202,7 +1203,7 @@ public sealed class Mp4BoxReader : IDisposable
     }
 
     static void CopyPayloadRange(
-        Stream source,
+        RecyclableMemoryStream source,
         long offset,
         ulong length,
         Stream destination
@@ -1214,30 +1215,18 @@ public sealed class Mp4BoxReader : IDisposable
         if (length > long.MaxValue)
             throw new InvalidDataException("Payload range is too large.");
 
-        long oldPosition = source.Position;
-        byte[] buffer = new byte[64 * 1024];
-        ulong remaining = length;
+        long count = (long)length;
+        ReadOnlySequence<byte> sequence = source.GetReadOnlySequence();
 
-        try
+        if (offset < 0 ||
+            count > sequence.Length ||
+            offset > sequence.Length - count)
         {
-            source.Position = offset;
-
-            while (remaining > 0)
-            {
-                int requested = (int)Math.Min((ulong)buffer.Length, remaining);
-                int read = source.Read(buffer.AsSpan(0, requested));
-
-                if (read <= 0)
-                    throw new EndOfStreamException("Unexpected end of fragment payload.");
-
-                destination.Write(buffer.AsSpan(0, read));
-                remaining -= (uint)read;
-            }
+            throw new EndOfStreamException("Unexpected end of fragment payload.");
         }
-        finally
-        {
-            source.Position = oldPosition;
-        }
+
+        foreach (ReadOnlyMemory<byte> block in sequence.Slice(offset, count))
+            destination.Write(block.Span);
     }
 
     void BuildSegment(int videoCount, int audioCount, bool allowSingleTrack = false)
@@ -1356,11 +1345,18 @@ public sealed class Mp4BoxReader : IDisposable
         var output = _segment;
         _segment = null;
 
-        _onSegment(new Segment(
-            output,
-            AddClockTime(_tfdtOffsetNs, ToNanoseconds(first.DecodeTime, first.Timescale)),
-            AddClockTime(_tfdtOffsetNs, ToNanoseconds(last.EndTime, last.Timescale))
-        ));
+        try
+        {
+            _onSegment(new Segment(
+                output,
+                AddClockTime(_tfdtOffsetNs, ToNanoseconds(first.DecodeTime, first.Timescale)),
+                AddClockTime(_tfdtOffsetNs, ToNanoseconds(last.EndTime, last.Timescale))
+            ));
+        }
+        finally
+        {
+            output.Dispose();
+        }
 
         if (hasVideo)
         {
