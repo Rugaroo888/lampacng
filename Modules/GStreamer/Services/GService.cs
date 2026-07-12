@@ -118,6 +118,18 @@ public static class GService
                 if (ModInit.conf.conf_uids != null && ModInit.conf.conf_uids.TryGetValue(uid, out var uidconf))
                     conf = uidconf;
 
+                if (conf.hdr_to_sdr && probe.Video?.IsHdr == true)
+                {
+                    if (probe.Video.VideoTransfer != VideoTransfer.Pq &&
+                        probe.Video.VideoTransfer != VideoTransfer.Hlg)
+                    {
+                        return (null, "HDR tone mapping requires a PQ or HLG base layer");
+                    }
+
+                    if (!HdrToneMappingBackend.IsAvailable)
+                        return (null, HdrToneMappingBackend.UnavailableError);
+                }
+
                 bool transcodeAVI = probe.IsAVI && conf.transcodeAVI;
 
                 if (!probe.IsMatroskaOrWebM && !transcodeAVI)

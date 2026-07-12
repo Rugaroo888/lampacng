@@ -147,7 +147,7 @@ public class GStreamerController : BaseController
     #region master.m3u8
     [AllowAnonymous]
     [HttpGet("/gst/{id}/master.m3u8")]
-    public ActionResult MasterPlaylist(ulong id, int audio)
+    public async Task<ActionResult> MasterPlaylist(ulong id, int audio)
     {
         SetHeadersNoCache();
 
@@ -155,7 +155,11 @@ public class GStreamerController : BaseController
         if (gstask == null)
             return NotFound();
 
+        if (!await gstask.EnsureInitAsync(audio, HttpContext.RequestAborted).ConfigureAwait(false))
+            return StatusCode(StatusCodes.Status502BadGateway);
+
         var probe = gstask.probe;
+        HlsVariantInfo variant = gstask.hlsVariantInfo;
         var playlist = StringBuilderPool.Rent();
 
         try
@@ -218,11 +222,16 @@ public class GStreamerController : BaseController
                     .Append(averageBandwidth.Value);
             }
 
-            if (probe != null)
-            {
-                if (probe.Video?.Width > 0 && probe.Video?.Height > 0)
-                    playlist.Append($",RESOLUTION={probe.Video.Width}x{probe.Video.Height}");
-            }
+            int width = variant?.Width > 0 ? variant.Width : probe?.Video?.Width ?? 0;
+            int height = variant?.Height > 0 ? variant.Height : probe?.Video?.Height ?? 0;
+            if (width > 0 && height > 0)
+                playlist.Append($",RESOLUTION={width}x{height}");
+            if (variant?.FrameRate > 0)
+                playlist.Append(",FRAME-RATE=").Append(variant.FrameRate.ToString("0.###", System.Globalization.CultureInfo.InvariantCulture));
+            if (!string.IsNullOrEmpty(variant?.Codecs))
+                playlist.Append($",CODECS=\"{variant.Codecs}\"");
+            if (variant?.VideoRange == "SDR" || variant?.VideoRange == "PQ" || variant?.VideoRange == "HLG")
+                playlist.Append($",VIDEO-RANGE={variant.VideoRange}");
 
             if (hasSubs)
                 playlist.Append(",SUBTITLES=\"subs\"");
@@ -314,22 +323,8 @@ public class GStreamerController : BaseController
         if (gstask == null)
             return NotFound();
 
-        if (gstask.initMp4 == null)
-        {
-            try
-            {
-                await gstask.semaphore.WaitAsync().ConfigureAwait(false);
-
-                gstask.EnsureSegment(-1, default, audio);
-
-                if (gstask.initMp4 == null)
-                    return StatusCode(502);
-            }
-            finally
-            {
-                gstask.semaphore.Release();
-            }
-        }
+        if (!await gstask.EnsureInitAsync(audio, HttpContext.RequestAborted).ConfigureAwait(false))
+            return StatusCode(StatusCodes.Status502BadGateway);
 
         Response.Headers.ContentLength = gstask.initMp4.Length;
         return File(gstask.initMp4, "video/mp4", true);

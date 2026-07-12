@@ -38,6 +38,7 @@ http://IP:9118/gst.js
 | `transcodeVP9` | `false` | Перекодировать VP9 в H.264. |
 | `transcodeVP8` | `false` | Разрешить VP8 и перекодировать его в H.264. |
 | `transcodeAVI` | `false` | Разрешить контейнер AVI и перекодировать его видео в H.264. |
+| `hdr_to_sdr` | `false` | Запросить HDR-to-SDR tone mapping только для обнаруженного HDR-видео. |
 
 Полный пример:
 
@@ -64,7 +65,8 @@ http://IP:9118/gst.js
   "transcodeAV1": false,
   "transcodeVP9": false,
   "transcodeVP8": false,
-  "transcodeAVI": false
+  "transcodeAVI": false,
+  "hdr_to_sdr": false
 }
 ```
 
@@ -154,3 +156,10 @@ C:\Program Files\gstreamer\1.0\mingw_x86_64
 Скачайте и установите GStreamer 1.28.3 Runtime Installer:
 
 https://gstreamer.freedesktop.org/download/#macos
+
+
+### HDR metadata и tone mapping
+
+`hdr_to_sdr` по умолчанию выключен. SDR-вход никогда не направляется в tone-mapping ветку. Для PQ/HLG используется native-элемент `hdrtonemap`: `zscale` переводит BT.2020 в линейный свет, Hable сжимает динамический диапазон, затем `zscale` формирует SDR BT.709 `I420` перед `x264enc`. При отсутствии элемента возвращается ошибка `HDR tone mapping backend is not available`, без некорректной подмены через `videoconvert`.
+
+Исходники и инструкции сборки находятся в [`native`](native/README.md). Windows-сборка статически включает FFmpeg/zimg в plugin; Linux-сборка использует системные shared libraries. Dolby Vision поддерживается только при наличии распознаваемого PQ/HLG base layer; динамические RPU metadata Hable не применяет.

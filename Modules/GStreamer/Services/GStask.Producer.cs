@@ -137,13 +137,20 @@ public partial class GStask
 
                 if (reusePipeline)
                 {
-                    // appsink снимает backpressure до сброса timeline mp4mux.
+                    // appsink снимает backpressure до сброса timeline mp4mux
                     using var mux = bin?.GetByName("mux");
+                    using var videoEncoder = IsVideoTranscoded
+                        ? bin?.GetByName("video_encoder")
+                        : null;
+
                     if (mux == null ||
+                        (IsVideoTranscoded && videoEncoder == null) ||
                         sink.SetState(State.Ready) == StateChangeReturn.Failure ||
                         mux.SetState(State.Ready) == StateChangeReturn.Failure ||
-                        sink.SetState(State.Paused) == StateChangeReturn.Failure ||
-                        mux.SetState(State.Paused) == StateChangeReturn.Failure)
+                        (videoEncoder != null && videoEncoder.SetState(State.Ready) == StateChangeReturn.Failure) ||
+                        (videoEncoder != null && videoEncoder.SetState(State.Paused) == StateChangeReturn.Failure) ||
+                        mux.SetState(State.Paused) == StateChangeReturn.Failure ||
+                        sink.SetState(State.Paused) == StateChangeReturn.Failure)
                     {
                         LogTaskError(
                             "SeekClockTime",
@@ -408,7 +415,7 @@ public partial class GStask
             segmentReadStarted = true;
 
             long start = Stopwatch.GetTimestamp();
-            var timeout = TimeSpan.FromSeconds(index == -1 ? 30 : 10);
+            var timeout = TimeSpan.FromSeconds(45);
 
             while (Stopwatch.GetElapsedTime(start) < timeout)
             {
@@ -533,6 +540,37 @@ public partial class GStask
 
             if (disposeTask)
                 Dispose();
+        }
+    }
+    #endregion
+
+    #region EnsureInitAsync
+    public async System.Threading.Tasks.Task<bool> EnsureInitAsync(int audio, CancellationToken cancellationToken)
+    {
+        if (initMp4 != null)
+            return true;
+
+        await semaphore.WaitAsync(cancellationToken).ConfigureAwait(false);
+
+        try
+        {
+            if (initMp4 != null)
+                return true;
+
+            EnsureSegment(-1, cancellationToken, audio);
+            return initMp4 != null;
+        }
+        catch (OperationCanceledException)
+        {
+            throw;
+        }
+        catch
+        {
+            return initMp4 != null;
+        }
+        finally
+        {
+            semaphore.Release();
         }
     }
     #endregion

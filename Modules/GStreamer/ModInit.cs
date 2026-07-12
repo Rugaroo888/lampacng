@@ -51,6 +51,7 @@ public class ModInit : IModuleLoaded
             conf.gst_version = gstVersion.Value;
 
         InitGst();
+        HardwareVideoBackend.Initialize();
     }
 
     public void Dispose()

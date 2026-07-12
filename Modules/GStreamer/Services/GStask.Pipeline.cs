@@ -66,15 +66,7 @@ public partial class GStask
         mq.sink_0
         """);
 
-        bool transcode =
-            probe.IsH264 && conf.transcodeH264 ||
-            probe.IsH265 && conf.transcodeH265 ||
-            probe.IsAV1 && conf.transcodeAV1 ||
-            probe.IsVP9 && conf.transcodeVP9 ||
-            probe.IsVP8 && conf.transcodeVP8 ||
-            probe.IsAVI && conf.transcodeAVI;
-
-        if (transcode)
+        if (IsVideoTranscoded)
         {
             AppendTranscodeToH264(sb, probe);
             return;
@@ -138,6 +130,12 @@ public partial class GStask
     void AppendTranscodeToH264(StringBuilder sb, ProbeInfo probe)
     {
         int segmentSeconds = Math.Max(1, conf.segment_seconds);
+        bool toneMapHdr = conf.hdr_to_sdr && probe.Video?.IsHdr == true;
+        string videoFilter = toneMapHdr
+            ? probe.Video.VideoTransfer == VideoTransfer.Hlg
+                ? "hdrtonemap transfer=hlg"
+                : "hdrtonemap transfer=pq"
+            : null;
 
         int frameRateNum = probe.Video?.FrameRateNum ?? 0;
         int frameRateDen = probe.Video?.FrameRateDen ?? 0;
@@ -146,23 +144,47 @@ public partial class GStask
             ? Math.Max(1, (int)Math.Round((double)frameRateNum * segmentSeconds / frameRateDen))
             : 25 * segmentSeconds;
 
+        string encoderPipeline = conf.hardwareAcceleration
+            ? HardwareVideoBackend.CreateH264Pipeline(
+                probe.Video?.Width ?? 0,
+                probe.Video?.Height ?? 0,
+                conf.video_bitrate,
+                keyIntMax
+            )
+            : null;
+
+        if (encoderPipeline == null)
+        {
+            string videoConverter = toneMapHdr ? string.Empty : "videoconvert !";
+
+            encoderPipeline = $$"""
+            {{videoConverter}}
+            video/x-raw,
+                format=I420 !
+            x264enc
+                name=video_encoder
+                tune=zerolatency
+                speed-preset=veryfast
+                bitrate={{conf.video_bitrate}}
+                key-int-max={{keyIntMax}}
+                bframes=0
+                byte-stream=false !
+            video/x-h264,
+                profile=main,
+                stream-format=avc,
+                alignment=au !
+            """;
+        }
+
+        string filterPipeline = videoFilter == null
+            ? string.Empty
+            : $"{videoFilter} !";
+
         sb.AppendLine($$"""
         mq.src_0 !
         decodebin !
-        videoconvert !
-        video/x-raw,
-            format=I420 !
-        x264enc
-            tune=zerolatency
-            speed-preset=veryfast
-            bitrate={{conf.video_bitrate}}
-            key-int-max={{keyIntMax}}
-            bframes=0
-            byte-stream=false !
-        video/x-h264,
-            profile=main,
-            stream-format=avc,
-            alignment=au !
+        {{filterPipeline}}
+        {{encoderPipeline}}
         h264parse
             config-interval=0 !
         h264timestamper !

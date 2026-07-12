@@ -79,6 +79,12 @@ public class ModuleConf : ModuleBaseConf
 
     public bool transcodeAVI { get; set; }
 
+    /// <summary>Convert detected HDR video to SDR. Requires a real HDR tone-mapping backend.</summary>
+    public bool hdr_to_sdr { get; set; }
+
+    /// <summary>Use a hardware H.264 backend after a successful startup probe.</summary>
+    public bool hardwareAcceleration { get; set; } = true;
+
     /// <summary>
     /// 14 Мбит/c
     /// </summary>
