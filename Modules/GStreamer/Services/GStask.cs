@@ -43,6 +43,7 @@ public partial class GStask
     public readonly ProbeInfo probe;
     public readonly string sourceUrl;
     public readonly ModuleConf conf;
+    public readonly CueTimeline cueTimeline;
 
     bool statePlaying = false;
 
@@ -69,7 +70,16 @@ public partial class GStask
     CancellationTokenSource busWatchCts;
     System.Threading.Tasks.Task busWatchTask;
 
-    public GStask(ProbeInfo probe, ModuleConf conf, string sourceUrl, ulong id, string user_uid, int audio, long? contentLength)
+    public GStask(
+        ProbeInfo probe,
+        ModuleConf conf,
+        string sourceUrl,
+        ulong id,
+        string user_uid,
+        int audio,
+        long? contentLength,
+        CueTimeline cueTimeline = null
+    )
     {
         this.id = id;
         this.probe = probe;
@@ -77,6 +87,7 @@ public partial class GStask
         this.sourceUrl = sourceUrl;
         this.conf = conf;
         this.contentLength = contentLength;
+        this.cueTimeline = cueTimeline;
 
         InitSegmentCache();
 
@@ -87,7 +98,8 @@ public partial class GStask
            onInit: OnInitMp4,
            onSegment: OnSegmentReady,
            segmentSeconds: conf.segment_seconds,
-           segmentDiff: IsVideoTranscoded ? 0 : conf.segment_diff
+           segmentDiff: IsVideoTranscoded ? 0 : conf.segment_diff,
+           cueMode: cueTimeline != null
         );
     }
     #endregion
@@ -95,12 +107,22 @@ public partial class GStask
     #region OnSegmentReady
     void OnSegmentReady(Segment segment)
     {
-        if (segment.startNs > 0)
-            Volatile.Write(ref positionSeconds, segment.startNs);
-
         int index = activeSegmentIndex;
         if (index < 0)
             return;
+
+        ulong segmentPositionNs = segment.startNs;
+
+        if (cueTimeline != null)
+        {
+            if (!cueTimeline.TryGetSegment(index, out CueSegment expected))
+                throw new InvalidOperationException($"Cue segment {index} does not exist.");
+
+            segmentPositionNs = expected.StartNs;
+        }
+
+        if (segmentPositionNs > 0)
+            Volatile.Write(ref positionSeconds, segmentPositionNs);
 
         if (!StoreSegmentFile(index, segment))
         {
@@ -108,7 +130,7 @@ public partial class GStask
         }
         else
         {
-            segmentStartNsByIndex[index] = segment.startNs;
+            segmentStartNsByIndex[index] = segmentPositionNs;
             Volatile.Write(ref readerSegmentIndex, index);
         }
     }
@@ -421,12 +443,17 @@ public partial class GStask
     {
         if (IsFrozen)
         {
-            ulong seekNs = segmentStartNsByIndex.TryGetValue(lastClientSegmentIndex, out ulong startNs)
-                ? startNs
-                : positionSeconds;
+            ulong seekNs;
+
+            if (cueTimeline?.TryGetSegment(lastClientSegmentIndex, out CueSegment cueSegment) == true)
+                seekNs = cueSegment.StartNs;
+            else if (segmentStartNsByIndex.TryGetValue(lastClientSegmentIndex, out ulong startNs))
+                seekNs = startNs;
+            else
+                seekNs = positionSeconds;
 
             InitSegmentCache();
-            if (!SeekClockTime(seekNs))
+            if (!SeekClockTime(seekNs, accurate: cueTimeline != null))
             {
                 LogTaskError(
                     "Defrost",

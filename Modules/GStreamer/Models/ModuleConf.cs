@@ -55,7 +55,7 @@ public class ModuleConf : ModuleBaseConf
     /// без transcode видео - примерная длительность сегмента
     /// для transcode видео - точная длительность сегмента
     /// </summary>
-    public int segment_seconds { get; set; } = 9;
+    public int segment_seconds { get; set; } = 6;
 
     /// <summary>
     /// граница выравнивания

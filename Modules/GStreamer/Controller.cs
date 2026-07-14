@@ -297,20 +297,35 @@ public class GStreamerController : BaseController
         if (gstask == null)
             return NotFound();
 
-        const long secondNs = 1_000_000_000L;
+        const ulong secondNs = 1_000_000_000UL;
 
-        long durationNs = gstask.probe.DurationNs;
-        if (durationNs <= 0)
-            durationNs = 200L * 60L * secondNs; // 200 min
+        CueTimeline cueTimeline = gstask.cueTimeline;
+        ulong durationNs = gstask.probe.DurationNs > 0
+            ? checked((ulong)gstask.probe.DurationNs)
+            : 200UL * 60UL * secondNs; // 200 min
 
         int segmentSeconds = Math.Max(1, gstask.conf.segment_seconds);
-        long segmentNs = checked((long)segmentSeconds * secondNs);
-        long count64 = durationNs / segmentNs;
+        ulong segmentNs = checked((ulong)segmentSeconds * secondNs);
+        int count;
+        ulong targetDuration;
 
-        if (durationNs % segmentNs != 0)
-            count64++;
+        if (cueTimeline != null)
+        {
+            count = cueTimeline.Count;
+            targetDuration = checked(
+                (cueTimeline.MaxDurationNs + secondNs - 1) / secondNs
+            );
+        }
+        else
+        {
+            ulong count64 = durationNs / segmentNs;
 
-        int count = checked((int)count64);
+            if (durationNs % segmentNs != 0)
+                count64++;
+
+            count = checked((int)count64);
+            targetDuration = (ulong)segmentSeconds;
+        }
 
         var playlist = StringBuilderPool.Rent();
 
@@ -320,7 +335,7 @@ public class GStreamerController : BaseController
             playlist.AppendLine("#EXT-X-PLAYLIST-TYPE:VOD");
             playlist.AppendLine("#EXT-X-VERSION:7");
             playlist.Append("#EXT-X-TARGETDURATION:")
-                    .Append(segmentSeconds)
+                    .Append(targetDuration)
                     .Append('\n');
             playlist.AppendLine("#EXT-X-MEDIA-SEQUENCE:0");
             playlist.Append("#EXT-X-MAP:URI=\"init.mp4?audio=")
@@ -329,15 +344,17 @@ public class GStreamerController : BaseController
 
             for (int i = 0; i < count; i++)
             {
-                long itemDurationNs = i + 1 == count
-                    ? durationNs - (long)i * segmentNs
-                    : segmentNs;
+                ulong itemDurationNs = cueTimeline != null
+                    ? cueTimeline.Segments[i].DurationNs
+                    : i + 1 == count
+                        ? durationNs - (ulong)i * segmentNs
+                        : segmentNs;
 
                 playlist
                     .Append("#EXTINF:")
                     .Append(
                         ((double)itemDurationNs / secondNs).ToString(
-                            "0.###",
+                            cueTimeline != null ? "0.######" : "0.###",
                             System.Globalization.CultureInfo.InvariantCulture
                         )
                     )
@@ -499,20 +516,35 @@ public class GStreamerController : BaseController
         if (gstask == null)
             return NotFound();
 
-        const long secondNs = 1_000_000_000L;
+        const ulong secondNs = 1_000_000_000UL;
 
-        long durationNs = gstask.probe.DurationNs;
-        if (durationNs <= 0)
-            durationNs = 200L * 60L * secondNs; // 200 min
+        CueTimeline cueTimeline = gstask.cueTimeline;
+        ulong durationNs = gstask.probe.DurationNs > 0
+            ? checked((ulong)gstask.probe.DurationNs)
+            : 200UL * 60UL * secondNs; // 200 min
 
         int segmentSeconds = Math.Max(1, gstask.conf.segment_seconds);
-        long segmentNs = checked((long)segmentSeconds * secondNs);
-        long count64 = durationNs / segmentNs;
+        ulong segmentNs = checked((ulong)segmentSeconds * secondNs);
+        int count;
+        ulong targetDuration;
 
-        if (durationNs % segmentNs != 0)
-            count64++;
+        if (cueTimeline != null)
+        {
+            count = cueTimeline.Count;
+            targetDuration = checked(
+                (cueTimeline.MaxDurationNs + secondNs - 1) / secondNs
+            );
+        }
+        else
+        {
+            ulong count64 = durationNs / segmentNs;
 
-        int count = checked((int)count64);
+            if (durationNs % segmentNs != 0)
+                count64++;
+
+            count = checked((int)count64);
+            targetDuration = (ulong)segmentSeconds;
+        }
 
         var playlist = StringBuilderPool.Rent();
 
@@ -522,21 +554,23 @@ public class GStreamerController : BaseController
             playlist.AppendLine("#EXT-X-PLAYLIST-TYPE:VOD");
             playlist.AppendLine("#EXT-X-VERSION:3");
             playlist.Append("#EXT-X-TARGETDURATION:")
-                    .Append(segmentSeconds)
+                    .Append(targetDuration)
                     .Append('\n');
             playlist.AppendLine("#EXT-X-MEDIA-SEQUENCE:0");
 
             for (int i = 0; i < count; i++)
             {
-                long itemDurationNs = i + 1 == count
-                    ? durationNs - (long)i * segmentNs
-                    : segmentNs;
+                ulong itemDurationNs = cueTimeline != null
+                    ? cueTimeline.Segments[i].DurationNs
+                    : i + 1 == count
+                        ? durationNs - (ulong)i * segmentNs
+                        : segmentNs;
 
                 playlist
                     .Append("#EXTINF:")
                     .Append(
                         ((double)itemDurationNs / secondNs).ToString(
-                            "0.###",
+                            cueTimeline != null ? "0.######" : "0.###",
                             System.Globalization.CultureInfo.InvariantCulture
                         )
                     )

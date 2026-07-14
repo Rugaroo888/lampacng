@@ -27,7 +27,15 @@ public partial class GStask
         return SeekClockTime(ns);
     }
 
-    bool SeekClockTime(ulong seekNs)
+    bool SeekSegment(int index)
+    {
+        if (cueTimeline?.TryGetSegment(index, out CueSegment segment) == true)
+            return SeekClockTime(segment.StartNs, accurate: true);
+
+        return Seek(index * conf.segment_seconds);
+    }
+
+    bool SeekClockTime(ulong seekNs, bool accurate = false)
     {
         CancellationTokenSource watchCts = null;
 
@@ -172,13 +180,21 @@ public partial class GStask
                 Volatile.Write(ref positionSeekSeconds, seekNs);
 
                 InstallVideoStartProbe(seekNs);
-                InstallVideoSegmentClipProbe();
+                InstallVideoSegmentClipProbe(
+                    accurate ? seekNs : ulong.MaxValue
+                );
+
+                SeekFlags seekFlags =
+                    SeekFlags.Flush |
+                    SeekFlags.KeyUnit |
+                    SeekFlags.SnapAfter;
+
+                if (accurate)
+                    seekFlags |= SeekFlags.Accurate;
 
                 bool ok = pipeline.SeekSimple(
                     Format.Time,
-                    SeekFlags.Flush |
-                    SeekFlags.KeyUnit |
-                    SeekFlags.SnapAfter,
+                    seekFlags,
                     (long)seekNs
                 );
 
@@ -400,6 +416,18 @@ public partial class GStask
             if (index >= 0 && SegmentFileReady(segmentIndex))
                 return true;
 
+            if (index >= 0 && cueTimeline != null)
+            {
+                if (!cueTimeline.TryGetSegment(segmentIndex, out CueSegment targetSegment))
+                    return false;
+
+                mp4Reader.SetTargetSegment(
+                    targetSegment.StartNs,
+                    targetSegment.EndNs,
+                    Math.Max(1UL, cueTimeline.TimestampScaleNs)
+                );
+            }
+
             lock (pipelineLock)
             {
                 if (Volatile.Read(ref pipelineStopping) != 0 ||
@@ -581,8 +609,12 @@ public partial class GStask
     #region EnsureClientSegment
     public bool EnsureClientSegment(int index, CancellationToken ct)
     {
-        if (index < 0 || IsDead)
+        if (index < 0 ||
+            IsDead ||
+            (cueTimeline != null && index >= cueTimeline.Count))
+        {
             return false;
+        }
 
         Volatile.Write(ref lastClientSegmentIndex, index);
 
@@ -595,7 +627,7 @@ public partial class GStask
         // а в cache его нет — без реального seek его уже нельзя получить.
         if (readerIndex >= 0 && index <= readerIndex)
         {
-            if (!Seek(index * conf.segment_seconds))
+            if (!SeekSegment(index))
                 return false;
 
             Volatile.Write(ref readerSegmentIndex, index - 1);
@@ -618,7 +650,7 @@ public partial class GStask
             return EnsureSegment(index, ct);
         }
 
-        if (!Seek(index * conf.segment_seconds))
+        if (!SeekSegment(index))
             return false;
 
         Volatile.Write(ref readerSegmentIndex, index - 1);
@@ -823,6 +855,9 @@ public partial class GStask
     {
         if (diff <= 0)
             return false;
+
+        if (cueTimeline != null)
+            return diff <= Math.Max(2, conf.segment_buffer);
 
         int segmentSeconds = Math.Max(1, conf.segment_seconds);
         int cutoff = Math.Max(2, conf.segment_buffer) * segmentSeconds;
