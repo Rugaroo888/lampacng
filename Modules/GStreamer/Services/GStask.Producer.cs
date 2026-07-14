@@ -197,17 +197,26 @@ public partial class GStask
                 if (accurate)
                     seekFlags |= SeekFlags.Accurate;
 
-                bool ok = pipeline.SeekSimple(
-                    Format.Time,
-                    seekFlags,
-                    (long)seekNs
+                using var multiqueue = bin.GetByName("mq");
+                using var videoPad = multiqueue?.GetStaticPad("src_0");
+
+                bool ok = videoPad != null && videoPad.SendEvent(
+                    Event.NewSeek(
+                        1.0,
+                        Format.Time,
+                        seekFlags,
+                        SeekType.Set,
+                        (long)seekNs,
+                        SeekType.None,
+                        -1
+                    )
                 );
 
                 if (!ok)
                 {
                     LogTaskError(
                         "SeekClockTime",
-                        "SeekSimple returned false.",
+                        "Video seek event returned false.",
                         seekNs: seekNs
                     );
 
