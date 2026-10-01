@@ -212,8 +212,11 @@ static partial class DatabaseStore
         string revisionData = JsonSerializer.Serialize(new { first, second, target, bookmarks, timecodes }, new JsonSerializerOptions { IncludeFields = true });
         var result = new MergeUsersResult
         {
-            firstUser = first, secondUser = second, targetUser = target,
-            syncInputRecords = bookmarks.Count, timecodeInputRecords = timecodes.Count,
+            firstUser = first,
+            secondUser = second,
+            targetUser = target,
+            syncInputRecords = bookmarks.Count,
+            timecodeInputRecords = timecodes.Count,
             revision = Convert.ToHexString(SHA256.HashData(Encoding.UTF8.GetBytes(revisionData)))
         };
         var mergedBookmarks = MergeBookmarks(bookmarks, target);
@@ -280,10 +283,21 @@ static partial class DatabaseStore
             var targetRow = group.rows.FirstOrDefault(row => row.user == target);
             JsonObject extra = new();
             foreach (var row in ordered.Where(row => !string.IsNullOrEmpty(row.extra))) FillMissingMergeFields(extra, MergeJsonObject(row.extra));
-            result.Add(new TimeMergeRow { id = targetRow?.id ?? winner.id, user = target, identity = group.identity, card = winner.card,
+            result.Add(new TimeMergeRow
+            {
+                id = targetRow?.id ?? winner.id,
+                user = target,
+                identity = group.identity,
+                card = winner.card,
                 item = (targetRow?.card == winner.card ? targetRow.item : null) ?? winner.item ?? ordered.FirstOrDefault(row => !string.IsNullOrEmpty(row.item))?.item,
-                position = winner.position, duration = winner.duration, percent = winner.percent, profile = winner.profile,
-                deleted = winner.deleted, watched = winner.watched, extra = extra.Count == 0 ? null : extra.ToJsonString() });
+                position = winner.position,
+                duration = winner.duration,
+                percent = winner.percent,
+                profile = winner.profile,
+                deleted = winner.deleted,
+                watched = winner.watched,
+                extra = extra.Count == 0 ? null : extra.ToJsonString()
+            });
         }
         hashCollisions = 0;
         var occupied = new HashSet<(string card, string item)>();
