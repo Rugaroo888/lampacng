@@ -45,6 +45,8 @@
     <Project Path="Modules/Adult/XvideosRED/XvideosRED.csproj" />
   </Folder>
   <Folder Name="/Modules/Community/">
+    <Project Path="Modules/Community/OidcAuth/OidcAuth.csproj" />
+    <Project Path="Modules/Community/QRAuth/QRAuth.csproj" />
     <Project Path="Modules/Community/TelegramAuth/TelegramAuth.csproj" />
     <Project Path="Modules/Community/TelegramAuthBot/TelegramAuthBot.csproj" />
     <Project Path="Modules/Tg-notify.bot/Tg-notify.bot.csproj" />
@@ -57,6 +59,7 @@
   </Folder>
   <Folder Name="/Modules/OnlineAnime/">
     <Project Path="Modules/OnlineAnime/AiLiberty/AiLiberty.csproj" />
+    <Project Path="Modules/OnlineAnime/AniDub/AniDub.csproj" />
     <Project Path="Modules/OnlineAnime/AniLiberty/AniLiberty.csproj" />
     <Project Path="Modules/OnlineAnime/AniLibria/AniLibria.csproj" />
     <Project Path="Modules/OnlineAnime/Animebesst/Animebesst.csproj" />
@@ -103,6 +106,7 @@
     <Project Path="Modules/OnlineRUS/Collaps/Collaps.csproj" />
     <Project Path="Modules/OnlineRUS/FanCDN/FanCDN.csproj" />
     <Project Path="Modules/OnlineRUS/FlixCDN/FlixCDN.csproj" />
+    <Project Path="Modules/OnlineRUS/Gencit/Gencit.csproj" />
     <Project Path="Modules/OnlineRUS/HDVB/HDVB.csproj" />
     <Project Path="Modules/OnlineRUS/Kinobase/Kinobase.csproj" />
     <Project Path="Modules/OnlineRUS/Kinogo/Kinogo.csproj" />
@@ -111,6 +115,7 @@
     <Project Path="Modules/OnlineRUS/Mirage/Mirage.csproj" />
     <Project Path="Modules/OnlineRUS/Phantom/Phantom.csproj" />
     <Project Path="Modules/OnlineRUS/PizdatoeHD/PizdatoeHD.csproj" />
+    <Project Path="Modules/OnlineRUS/RuDub/RuDub.csproj" />
     <Project Path="Modules/OnlineRUS/RutubeMovie/RutubeMovie.csproj" />
     <Project Path="Modules/OnlineRUS/Spectre/Spectre.csproj" />
     <Project Path="Modules/OnlineRUS/VeoVeo/VeoVeo.csproj" />

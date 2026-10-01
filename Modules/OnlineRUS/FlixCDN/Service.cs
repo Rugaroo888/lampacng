@@ -1,53 +1,120 @@
-using Shared.Models.Base;
 using Shared.Models.Online.Settings;
 using Shared.Models.Templates;
 using Shared.Services;
-using Shared.Services.Utilities;
 using System;
 using System.Collections.Generic;
+using System.Text.Json;
 using System.Text.RegularExpressions;
 using System.Threading.Tasks;
-using System.Web;
 
 namespace FlixCDN;
 
 public struct FlixCDNInvoke
 {
-    #region FlixCDNInvoke
-    string host;
     OnlinesSettings init;
     HttpHydra httpHydra;
     Func<string, string> onstreamfile;
 
-    public FlixCDNInvoke(string host, OnlinesSettings init, HttpHydra httpHydra, Func<string, string> onstreamfile)
+    static readonly JsonSerializerOptions jsonOptions = new()
     {
-        this.host = host;
+        PropertyNameCaseInsensitive = true
+    };
+
+    public FlixCDNInvoke(OnlinesSettings init, HttpHydra httpHydra, Func<string, string> onstreamfile)
+    {
         this.init = init;
         this.httpHydra = httpHydra;
         this.onstreamfile = onstreamfile;
     }
-    #endregion
 
-    #region StreamQuality
+
+    public string BuildPlayerUrl(long kinopoisk_id)
+    {
+        return $"{init.host}/show/kinopoisk/{kinopoisk_id}?extrans=1&extepi=1&unfseason=1";
+    }
+
+
+    async public Task<PlayerPayload> GetPlayer(long kinopoisk_id)
+    {
+        if (kinopoisk_id <= 0)
+            return null;
+
+        string html = await httpHydra.Get(BuildPlayerUrl(kinopoisk_id), safety: true);
+        return ParsePlayer(html);
+    }
+
+
+    static PlayerPayload ParsePlayer(string html)
+    {
+        if (string.IsNullOrWhiteSpace(html))
+            return null;
+
+        const string marker = "window.__PLAYER_PAYLOAD__ = ";
+        int start = html.IndexOf(marker, StringComparison.Ordinal);
+        if (start < 0)
+            return null;
+
+        start += marker.Length;
+        int end = html.IndexOf(';', start);
+        if (end < 0)
+            return null;
+
+        string json = html.Substring(start, end - start).Trim();
+        if (string.IsNullOrWhiteSpace(json))
+            return null;
+
+        try
+        {
+            return JsonSerializer.Deserialize<PlayerPayload>(json, jsonOptions);
+        }
+        catch
+        {
+            return null;
+        }
+    }
+
     public StreamQualityTpl GetStreamQualityTpl(string file)
     {
         var streamquality = new StreamQualityTpl();
+        var qualityByLink = new Dictionary<string, int>(StringComparer.OrdinalIgnoreCase);
+        var linkOrder = new List<string>();
 
-        foreach (Match m in Regex.Matches(file, "\\[(?<q>\\d{3,4})\\](?<url>https?://[^,\"\\[\\s]+)"))
+        foreach (Match m in Regex.Matches(file ?? string.Empty, "\\[(?<q>\\d{3,4})\\](?<url>https?://[^,\"\\[\\s]+)"))
         {
-            string q = m.Groups["q"].Value;
             string link = m.Groups["url"].Value;
-
-            if (string.IsNullOrEmpty(link) || string.IsNullOrEmpty(q))
+            if (string.IsNullOrEmpty(link) || !int.TryParse(m.Groups["q"].Value, out int quality))
                 continue;
 
-            streamquality.Insert(onstreamfile.Invoke(link), $"{q}p");
+            if (qualityByLink.TryGetValue(link, out int currentQuality))
+            {
+                if (quality > currentQuality)
+                {
+                    string restoredLink = RestoreQualityLink(link, currentQuality, quality);
+                    if (!string.Equals(restoredLink, link, StringComparison.OrdinalIgnoreCase) && !qualityByLink.ContainsKey(restoredLink))
+                    {
+                        qualityByLink[restoredLink] = quality;
+                        linkOrder.Add(restoredLink);
+                    }
+                }
+                else if (quality < currentQuality)
+                {
+                    qualityByLink[link] = quality;
+                }
+
+                continue;
+            }
+
+            qualityByLink[link] = quality;
+            linkOrder.Add(link);
         }
+
+        foreach (string link in linkOrder)
+            streamquality.Insert(onstreamfile.Invoke(link), $"{qualityByLink[link]}p");
 
         if (!streamquality.IsEmpty)
             return streamquality;
 
-        foreach (Match m in Regex.Matches(file, "(https?://[^,\"\\[\\s]+\\.(m3u8|mp4)(:hls:manifest\\.m3u8)?)"))
+        foreach (Match m in Regex.Matches(file ?? string.Empty, "(https?://[^,\"\\[\\s]+\\.(m3u8|mp4)(:hls:manifest\\.m3u8)?)"))
         {
             string link = m.Groups[1].Value;
             if (string.IsNullOrEmpty(link))
@@ -59,93 +126,18 @@ public struct FlixCDNInvoke
 
         return streamquality;
     }
-    #endregion
 
-    #region BuildIframeUrl
-    public string BuildIframeUrl(string iframe, int t, int s, int e)
+
+    static string RestoreQualityLink(string link, int sourceQuality, int targetQuality)
     {
-        var args = new List<string>(3);
+        if (string.IsNullOrEmpty(link) || sourceQuality <= 0 || targetQuality <= sourceQuality)
+            return link;
 
-        if (t > 0)
-            args.Add("translation=" + t);
+        string source = $"/{sourceQuality}.mp4";
+        int index = link.IndexOf(source, StringComparison.OrdinalIgnoreCase);
+        if (index < 0)
+            return link;
 
-        if (s > 0)
-            args.Add("season=" + s);
-
-        if (e > 0)
-            args.Add("episode=" + e);
-
-        if (args.Count == 0)
-            return iframe;
-
-        return iframe + (iframe.Contains("?") ? "&" : "?") + string.Join("&", args);
+        return link.Substring(0, index) + $"/{targetQuality}.mp4" + link.Substring(index + source.Length);
     }
-    #endregion
-
-    #region SearchByTitle
-    async public Task<SearchItem> SearchByTitle(string imdb_id, long kinopoisk_id, string title, string original_title, bool forceSimilar)
-    {
-        if (string.IsNullOrWhiteSpace(title) && string.IsNullOrWhiteSpace(original_title))
-            return null;
-
-        var root = await ApiSearch($"title={HttpUtility.UrlEncode(title ?? original_title)}");
-        if (root == null || root.Length == 0)
-            return null;
-
-        var stpl = new SimilarTpl(root.Length);
-        string enc_title = HttpUtility.UrlEncode(title);
-        string enc_original_title = HttpUtility.UrlEncode(original_title);
-
-        string stitle = SearchNameTo.Convert(title);
-        string sorig = SearchNameTo.Convert(original_title);
-
-        SearchItem exact = null;
-
-        foreach (var item in root)
-        {
-            string name = item.title_rus ?? item.title_orig;
-            if (string.IsNullOrEmpty(name))
-                continue;
-
-            string details = item.year > 0 ? item.year.ToString() : string.Empty;
-
-            stpl.Append(
-                name,
-                details,
-                string.Empty,
-                $"{host}/lite/flixcdn?kinopoisk_id={kinopoisk_id}&imdb_id={imdb_id}&title={HttpUtility.UrlEncode(item.title_rus)}&original_title={HttpUtility.UrlEncode(item.title_orig)}&year={item.year}",
-                PosterApi.Size(item.poster)
-            );
-
-            if (exact == null)
-            {
-                if (SearchNameTo.Contains(name, stitle) ||
-                    SearchNameTo.Contains(name, sorig))
-                    exact = item;
-            }
-        }
-
-        if (forceSimilar)
-            return new SearchItem() { similar = stpl };
-
-        if (exact != null)
-            return exact;
-
-        if (root.Length == 1)
-            return root[0];
-
-        if (stpl.Length > 0)
-            return new SearchItem() { similar = stpl };
-
-        return null;
-    }
-
-    async Task<SearchItem[]> ApiSearch(string query)
-    {
-        string uri = $"{init.apihost}/search?token={init.token}&{query}";
-        var root = await httpHydra.Get<SearchRoot>(uri, safety: true);
-
-        return root?.result;
-    }
-    #endregion
 }

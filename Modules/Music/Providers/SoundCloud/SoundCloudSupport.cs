@@ -28,7 +28,7 @@ public static partial class SoundCloudSupport
     public const string UserTracksAlbumPrefix = "soundcloud:usertracks:";
     public const string UserSectionPrefix = "soundcloud:usersection:";
 
-    static readonly HttpClient httpClient = FriendlyHttp.CreateHttpClient(useCookies: false);
+    static readonly HttpClient httpClient = MusicHttp.CreateClient("soundcloud");
     static readonly Regex apiClientIdRegex = new("\"apiClient\".*?\"id\":\"([^\"]+)\"", RegexOptions.IgnoreCase | RegexOptions.Singleline | RegexOptions.Compiled);
     static readonly Regex publicClientIdRegex = new("(?:client_id|clientId)\\s*[:=]\\s*[\"']?([A-Za-z0-9_-]{20,})", RegexOptions.IgnoreCase | RegexOptions.Compiled);
     static readonly Regex publicAssetRegex = new("https://a-v2\\.sndcdn\\.com/assets/[^\"'<>\\s]+\\.js", RegexOptions.IgnoreCase | RegexOptions.Compiled);
@@ -41,7 +41,7 @@ public static partial class SoundCloudSupport
     static readonly SemaphoreSlim publicClientIdLock = new(1, 1);
     static string publicClientId;
     static DateTime publicClientIdExpiresAt;
-    const string chartsCacheVersion = "v8";
+    const string chartsCacheVersion = "v9";
 
     static SoundCloudSupport()
     {
@@ -59,7 +59,13 @@ public static partial class SoundCloudSupport
     public static bool HasClientCredentials() => HasClientId() && !string.IsNullOrWhiteSpace(ModInit.conf?.soundcloud_client_secret);
     public static bool HasOAuthConfig() => HasClientCredentials() && !string.IsNullOrWhiteSpace(ModInit.conf?.soundcloud_redirect_uri);
 
-    public static string Country => string.IsNullOrWhiteSpace(ModInit.conf?.soundcloud_country) ? "US" : ModInit.conf.soundcloud_country.Trim().ToUpperInvariant();
+    public static string Country => NormalizeCountry(ModInit.conf?.soundcloud_country);
+
+    public static string NormalizeCountry(string country)
+    {
+        country = country?.Trim().ToUpperInvariant();
+        return country is "GB" or "UK" ? "UK" : "US";
+    }
 
     public static string BuildApiUrl(string path, IDictionary<string, string> query = null)
     {
@@ -633,6 +639,14 @@ public static partial class SoundCloudSupport
             return parsed;
 
         return null;
+    }
+
+    static string GetTrackIsrc(JsonElement track)
+    {
+        if (!track.TryGetProperty("publisher_metadata", out var publisher) || publisher.ValueKind != JsonValueKind.Object)
+            return null;
+
+        return MusicIsrc.Normalize(GetString(publisher, "isrc"));
     }
 
     static int GetArrayLength(JsonElement element, string propertyName)

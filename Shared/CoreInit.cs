@@ -168,27 +168,9 @@ public class CoreInit
         if (_tempConf == null)
             throw new Exception("Failed to deserialize init.conf");
 
-        conf = _tempConf;
+        _tempConf.accsdb.MergeAccounts();
 
-        if (conf.accsdb.accounts != null)
-        {
-            foreach (var u in conf.accsdb.accounts)
-            {
-                if (conf.accsdb.findUser(u.Key) is AccsUser user)
-                {
-                    if (u.Value > user.expires)
-                        user.expires = u.Value;
-                }
-                else
-                {
-                    conf.accsdb.users.Add(new AccsUser()
-                    {
-                        id = u.Key.ToLowerAndTrim(),
-                        expires = u.Value
-                    });
-                }
-            }
-        }
+        conf = _tempConf;
 
         PosterApi.Initialization(conf.omdbapi_key, conf.posterApi);
     }
@@ -219,25 +201,7 @@ public class CoreInit
                             }
                         });
 
-                        if (conf.accsdb.accounts != null)
-                        {
-                            foreach (var u in conf.accsdb.accounts)
-                            {
-                                if (conf.accsdb.findUser(u.Key) is AccsUser user)
-                                {
-                                    if (u.Value > user.expires)
-                                        user.expires = u.Value;
-                                }
-                                else
-                                {
-                                    conf.accsdb.users.Add(new AccsUser()
-                                    {
-                                        id = u.Key.ToLowerAndTrim(),
-                                        expires = u.Value
-                                    });
-                                }
-                            }
-                        }
+                        conf.accsdb.MergeAccounts();
 
                         PosterApi.Initialization(conf.omdbapi_key, conf.posterApi);
                     }
@@ -256,13 +220,15 @@ public class CoreInit
     public static string Host(HttpContext httpContext, string suffix = null)
     {
         string scheme = string.IsNullOrEmpty(conf.listen.scheme) ? httpContext.Request.Scheme : conf.listen.scheme;
-        if (httpContext.Request.Headers.TryGetValue("xscheme", out var xscheme) && xscheme.Count > 0)
-            scheme = xscheme;
+        if (httpContext.Request.Headers.TryGetValue("xscheme", out var xscheme) && xscheme.Count > 0 && xscheme[0] is "http" or "https")
+            scheme = xscheme[0];
 
         if (!string.IsNullOrEmpty(conf.listen.host))
             return $"{scheme}://{conf.listen.host}{suffix}";
 
-        if (httpContext.Request.Headers.TryGetValue("xhost", out var xhost) && xhost.Count > 0)
+        // xhost is only for internal self-requests; clients must not control the advertised host
+        if (httpContext.Request.Headers.TryGetValue("xhost", out var xhost) && xhost.Count > 0
+            && httpContext.Request.Headers.TryGetValue("lcrqpasswd", out var passwd) && passwd.Count > 0 && passwd[0] == rootPasswd)
             return $"{scheme}://{Regex.Replace(xhost, "^https?://", "")}{suffix}";
 
         return $"{scheme}://{httpContext.Request.Host.Value}{suffix}";
@@ -347,8 +313,8 @@ public class CoreInit
     {
         api_key = "4ef0d7355d9ffb5151e987764708ce96",
         scheme = "https",
-        domain = "cub.red",
-        mirror = "cub.rip"
+        domain = "cub.best",
+        mirror = "cub.best"
     };
 
     public PosterApiConf posterApi = new PosterApiConf()

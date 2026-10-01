@@ -1,0 +1,40 @@
+---
+title: "TimeCode: позиция воспроизведения"
+sidebarTitle: "TimeCode"
+description: "Сохраняйте и восстанавливайте позицию просмотра через /timecode.js и /timecode/*."
+keywords: ["TimeCode", "timecode.js", "SQLite"]
+---
+
+SQLite: `database/TimeCode.sql`.
+
+## Состояние
+
+Starter `example.init.conf` исключает `TimeCode`.
+
+## Маршруты
+
+| Метод | Путь | Назначение |
+| --- | --- | --- |
+| `GET` | `/timecode.js` | Plugin |
+| `GET` | `/timecode/js/{token}` | Plugin с токеном |
+| `GET` | `/timecode/all` | Все позиции (веб-Lampa) |
+| `POST` | `/timecode/add` | Записать (веб-Lampa) |
+| `GET` | `/timecode/dump` | Полная выгрузка для нативного клиента |
+| `GET` | `/timecode/changelog?since=&limit=` | Дельты; `limit` не больше `20000` |
+| `GET` | `/timecode/areas` | Области данных пользователя по профилям |
+| `POST` | `/timecode/set` | Запись для нативного клиента |
+
+`POST /timecode/set` принимает одну запись, массив или объект `{ rows }`. Чтобы удалить запись, передайте её с `deleted: true`.
+
+## Конфигурация
+
+```json
+{
+  "BaseModule": { "SkipModules": [] },
+  "TimeCode": { "enable": true }
+}
+```
+
+<Note>Модуль безопасен для локальной сети; для удалённого доступа включите accsdb и HTTPS.</Note>
+
+Проверка: `curl -fsS http://127.0.0.1:9118/timecode.js`

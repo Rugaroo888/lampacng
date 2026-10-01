@@ -1,12 +1,13 @@
 enable: true
 displayindex: 210
 displayname: NoodleMagazine
-host: https://adult.noodlemagazine.com
-client_type: apk,cors
-rch_access: apk,cors
-stream_access: apk,cors
-qualitys_proxy: false
+host: https://hot.noodlemagazine.com
+#client_type: web,apk,cors
+#rch_access: web,apk,cors
+#stream_access: web,apk,cors
+qualitys_proxy: true
 streamproxy_preview: true
+geostreamproxy: ["ALL"]
 
 menu:
   sort:
@@ -14,7 +15,7 @@ menu:
     Популярное: popular/week?p={page}
 
 list:
-  uri: now?p={page}
+  uri: home?p={page}
 
 search:
   uri: video/{search}?p={page}

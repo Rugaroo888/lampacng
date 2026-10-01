@@ -17,7 +17,7 @@
 | `/testaccsdb` | Проверка доступа accsdb (GET/POST); см. также **`EventListener.Accsdb`** в `ModInit`. |
 | `/app.min.js`, `/{type}/app.min.js` | Сборка минифицированного приложения. |
 | `/css/app.css` | Стили. |
-| `msx/start.json`, `samsung.wgt`, `lg.ipk` | Специфичные для ТВ пакеты (MSX, Samsung Tizen, LG webOS). |
+| `msx/start.json`, `samsung.wgt`, `lg.ipk` | Специфичные для ТВ пакеты (MSX, Samsung Tizen, LG webOS). Для `samsung.wgt` параметр `?tizen=3` убирает `tizen:service` — без этого виджет не ставится на Tizen 3.0 и ниже. |
 | `/lampainit.js` | Инициализация клиента (подстановки плагинов, **deny.js**, токены). |
 | `/on.js`, `/on/js/{token}`, `/on/h/{token}`, `/on/{token}` | Режим онлайн-плагина. |
 | `/dorama.js`, `/dorama/js/{token}` | Отдельный Lampa-плагин пункта **«Дорамы»** и источника `lampac_dorama`. |
@@ -38,6 +38,47 @@
 - **`intervalupdate`** — период cron (минуты);
 - **`initPlugins.dorama`** — подключает отдельный Lampa-плагин **`/dorama.js`** в `/lampainit.js` и `/on.js`;
 - **`limit_map`** — WAF для **`^/(extensions|testaccsdb|msx/)`**.
+
+## initPlugins и конфликты URL
+
+Lampac отдаёт плагины двумя путями:
+
+| Entry point | Назначение |
+|-------------|------------|
+| **`/lampainit.js`** | Регистрация в `Lampa.Plugins` + первичные настройки клиента (`{initiale}`) |
+| **`/on.js`**, **`/on/js/{token}`** | Прямая загрузка скриптов без registry |
+
+Список плагинов для обоих маршрутов собирается **`LampaPluginBuilder`** ([`LampaPluginBuilder.cs`](LampaPluginBuilder.cs)) по флагам **`LampaWeb.initPlugins`** и **`customPlugins`**.
+
+### Default URL (flat)
+
+В `{initiale}` всегда подставляются flat-URL вида `{localhost}/online.js`, `{localhost}/sync.js` и т.д. Сервер **не** подменяет их на `*/js/{token}` автоматически.
+
+### Token URL (ручная установка)
+
+Пользователь может добавить token-вариант вручную, например `{localhost}/sync/js/myuser` или `{localhost}/online/js/myuser`. На клиенте [`plugins/lampainit.js`](plugins/lampainit.js) при каждом старте:
+
+- сравнивает server list с уже установленными плагинами;
+- **не добавляет** flat-URL, если в registry уже есть любой URL того же семейства (`name.js` и `name/js/{token}` считаются одним плагином);
+- при наличии token-варианта может удалить flat-дубликат (если в runtime Lampa доступен `Plugins.remove`).
+
+### Sync orchestrator
+
+Если включён **`initPlugins.sync`**, модуль **`sync.js`** сам загружает bookmark и timecode. Builder **не** добавляет отдельные `bookmark.js` / `timecode.js` в `{initiale}` и `/on.js`, даже если их флаги в конфиге `true`. Рекомендуется в `init.conf` при `sync: true` явно ставить `bookmark: false`, `timecode: false`.
+
+### customPlugins
+
+Записи из **`LampaWeb.customPlugins`** ( `status: 1` ) добавляются as-is. Family dedup на клиенте применяется и к ним — например, custom `{localhost}/music/js/token` блокирует добавление flat `{localhost}/music.js` из другого источника.
+
+### Плагины без token-маршрута
+
+`watchtogether.js`, `startpage.js` — dedup только по exact URL.
+
+### Регрессионный тест dedup
+
+```bash
+node Modules/LampaWeb/plugins/lampainit-dedup.test.js
+```
 
 ## Дорамы
 

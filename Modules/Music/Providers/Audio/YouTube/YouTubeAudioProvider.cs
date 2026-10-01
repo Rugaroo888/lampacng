@@ -7,15 +7,15 @@ namespace Music;
 
 public class YouTubeAudioProvider : IMusicAudioProvider
 {
-    static readonly YoutubeClient youtube = new();
-
     // спекулятивный манифест: после первой пачки поиска манифест
     // промежуточного топ-кандидата тянется ПАРАЛЛЕЛЬНО со второй пачкой —
     // победитель ранжирования после неё почти никогда не меняется, и
     // GetStreamsAsync забирает готовый результат вместо ещё одного ~1.5s
     // запроса. Промах (победитель сменился/спекуляция упала) — обычный путь.
-    static readonly ConcurrentDictionary<string, (DateTime at, Task<StreamManifest> task)> speculativeManifests = new();
+    static readonly ConcurrentDictionary<string, (DateTime at, Task<ResolvedManifest> task)> speculativeManifests = new();
     static readonly TimeSpan speculativeManifestTtl = TimeSpan.FromMinutes(2);
+
+    sealed record ResolvedManifest(StreamManifest Manifest, MusicProxyLease ProxyLease);
 
     public string Id => "youtubeaudio";
     public string Name => "YouTube Audio";
@@ -35,6 +35,8 @@ public class YouTubeAudioProvider : IMusicAudioProvider
 
         try
         {
+            var proxyLease = MusicProxyService.Acquire(Id, MusicProxyPurpose.Api);
+            using var youtube = new YoutubeClient(MusicHttp.GetTransport(proxyLease));
             var results = new List<VideoSearchResult>();
             var seen = new HashSet<string>(StringComparer.Ordinal);
 
@@ -50,7 +52,7 @@ public class YouTubeAudioProvider : IMusicAudioProvider
                 var batchTasks = queries
                     .Skip(batchStart)
                     .Take(3)
-                    .Select(query => FetchQueryResultsAsync(query, cancellationToken))
+                    .Select(query => FetchQueryResultsAsync(youtube, query, cancellationToken))
                     .ToList();
 
                 await Task.WhenAll(batchTasks);
@@ -88,6 +90,7 @@ public class YouTubeAudioProvider : IMusicAudioProvider
                             if (manifestTask != null)
                             {
                                 await manifestTask.WaitAsync(cancellationToken);
+                                proxyLease.Success();
                                 return earlyRanked;
                             }
                         }
@@ -115,6 +118,7 @@ public class YouTubeAudioProvider : IMusicAudioProvider
 
             var matches = YouTubeAudioSupport.ConvertSearchResults(results);
             var ranked = YouTubeAudioSupport.RankMatches(track, matches, playbackMode);
+            proxyLease.Success();
             if (directMatch == null)
                 return ranked;
 
@@ -122,9 +126,19 @@ public class YouTubeAudioProvider : IMusicAudioProvider
             ordered.AddRange(ranked.Where(i => !string.Equals(i.id, directMatch.id, StringComparison.Ordinal)));
             return ordered;
         }
-        catch
+        catch (OperationCanceledException)
         {
-            return directMatch != null ? new[] { directMatch } : Array.Empty<MusicAudioMatch>();
+            throw;
+        }
+        catch (Exception ex)
+        {
+            if (MusicHttp.IsProxyFailure(ex))
+                MusicProxyService.ReportFailure($"Music:{Id}:api");
+
+            if (directMatch != null)
+                return new[] { directMatch };
+
+            throw new MusicAudioTransientException(Id, "match", ex);
         }
     }
 
@@ -138,6 +152,8 @@ public class YouTubeAudioProvider : IMusicAudioProvider
 
         try
         {
+            var proxyLease = MusicProxyService.Acquire(Id, MusicProxyPurpose.Api);
+            using var youtube = new YoutubeClient(MusicHttp.GetTransport(proxyLease));
             var results = new List<VideoSearchResult>();
 
             await foreach (var video in youtube.Search.GetVideosAsync(query, cancellationToken))
@@ -147,11 +163,19 @@ public class YouTubeAudioProvider : IMusicAudioProvider
                     break;
             }
 
+            proxyLease.Success();
             return YouTubeAudioSupport.ConvertSearchResults(results);
         }
-        catch
+        catch (OperationCanceledException)
         {
-            return Array.Empty<MusicAudioMatch>();
+            throw;
+        }
+        catch (Exception ex)
+        {
+            if (MusicHttp.IsProxyFailure(ex))
+                MusicProxyService.ReportFailure($"Music:{Id}:api");
+
+            throw new MusicAudioTransientException(Id, "search", ex);
         }
     }
 
@@ -164,16 +188,26 @@ public class YouTubeAudioProvider : IMusicAudioProvider
         {
             try
             {
-                var manifest = attempt == 0 ? await TryTakeSpeculativeManifestAsync(match.id) : null;
-                manifest ??= await youtube.Videos.Streams.GetManifestAsync(match.id, cancellationToken);
+                var resolved = attempt == 0 ? await TryTakeSpeculativeManifestAsync(match.id) : null;
+                resolved ??= await ResolveManifestAsync(match.id, cancellationToken);
                 if (MusicPlaybackModeService.IsVideo(playbackMode))
                 {
-                    var videoStreams = manifest.GetMuxedStreams();
-                    return YouTubeAudioSupport.ConvertVideoStreams(videoStreams);
+                    var videoStreams = resolved.Manifest.GetMuxedStreams();
+                    var sources = YouTubeAudioSupport.ConvertVideoStreams(videoStreams);
+                    foreach (var source in sources)
+                        resolved.ProxyLease.ApplyTo(source, overwrite: true);
+                    return sources;
                 }
 
-                var audioStreams = manifest.GetAudioOnlyStreams();
-                return YouTubeAudioSupport.ConvertAudioStreams(audioStreams);
+                var audioStreams = resolved.Manifest.GetAudioOnlyStreams();
+                var audioSources = YouTubeAudioSupport.ConvertAudioStreams(audioStreams);
+                foreach (var source in audioSources)
+                    resolved.ProxyLease.ApplyTo(source, overwrite: true);
+                return audioSources;
+            }
+            catch (OperationCanceledException)
+            {
+                throw;
             }
             catch (Exception ex)
             {
@@ -184,7 +218,10 @@ public class YouTubeAudioProvider : IMusicAudioProvider
                 }
 
                 Console.WriteLine($"[Music] youtube stream manifest failed for {match.id}: {ex.GetType().Name}: {ex.Message}");
-                return Array.Empty<MusicPlaybackSource>();
+                if (IsPermanentManifestFailure(ex))
+                    return Array.Empty<MusicPlaybackSource>();
+
+                throw new MusicAudioTransientException(Id, "stream", ex);
             }
         }
 
@@ -211,10 +248,15 @@ public class YouTubeAudioProvider : IMusicAudioProvider
         return Array.Empty<string>();
     }
 
-    static Task<StreamManifest> StartSpeculativeManifest(string videoId)
+    static Task<ResolvedManifest> StartSpeculativeManifest(string videoId)
     {
-        if (string.IsNullOrWhiteSpace(videoId) || speculativeManifests.ContainsKey(videoId))
-            return speculativeManifests.TryGetValue(videoId, out var existing) ? existing.task : null;
+        if (string.IsNullOrWhiteSpace(videoId))
+            return null;
+
+        var proxyLease = MusicProxyService.Acquire("youtubeaudio", MusicProxyPurpose.Stream);
+        string cacheKey = BuildManifestCacheKey(videoId, proxyLease);
+        if (speculativeManifests.ContainsKey(cacheKey))
+            return speculativeManifests.TryGetValue(cacheKey, out var existing) ? existing.task : null;
 
         // уборка протухших записей (непотреблённые спекуляции — промахи ранжирования)
         foreach (var entry in speculativeManifests)
@@ -225,15 +267,20 @@ public class YouTubeAudioProvider : IMusicAudioProvider
 
         // CancellationToken.None: спекуляция переживает отмену исходного запроса —
         // результат заберёт следующий GetStreams по тому же видео в пределах TTL
-        var task = youtube.Videos.Streams.GetManifestAsync(videoId, CancellationToken.None).AsTask();
-        speculativeManifests[videoId] = (DateTime.UtcNow, task);
+        var task = ResolveManifestAsync(videoId, CancellationToken.None, proxyLease);
+        speculativeManifests[cacheKey] = (DateTime.UtcNow, task);
         _ = task.ContinueWith(t => { _ = t.Exception; }, TaskContinuationOptions.OnlyOnFaulted);
         return task;
     }
 
-    static async Task<StreamManifest> TryTakeSpeculativeManifestAsync(string videoId)
+    static async Task<ResolvedManifest> TryTakeSpeculativeManifestAsync(string videoId)
     {
-        if (string.IsNullOrWhiteSpace(videoId) || !speculativeManifests.TryRemove(videoId, out var entry))
+        if (string.IsNullOrWhiteSpace(videoId))
+            return null;
+
+        var proxyLease = MusicProxyService.Acquire("youtubeaudio", MusicProxyPurpose.Stream);
+        string cacheKey = BuildManifestCacheKey(videoId, proxyLease);
+        if (!speculativeManifests.TryRemove(cacheKey, out var entry))
             return null;
 
         if (DateTime.UtcNow - entry.at > speculativeManifestTtl)
@@ -251,7 +298,7 @@ public class YouTubeAudioProvider : IMusicAudioProvider
         }
     }
 
-    static async Task<List<VideoSearchResult>> FetchQueryResultsAsync(string query, CancellationToken cancellationToken)
+    static async Task<List<VideoSearchResult>> FetchQueryResultsAsync(YoutubeClient youtube, string query, CancellationToken cancellationToken)
     {
         var list = new List<VideoSearchResult>();
 
@@ -265,10 +312,50 @@ public class YouTubeAudioProvider : IMusicAudioProvider
         return list;
     }
 
+    static async Task<ResolvedManifest> ResolveManifestAsync(string videoId, CancellationToken cancellationToken, MusicProxyLease proxyLease = null)
+    {
+        proxyLease ??= MusicProxyService.Acquire("youtubeaudio", MusicProxyPurpose.Stream);
+
+        try
+        {
+            using var youtube = new YoutubeClient(MusicHttp.GetTransport(proxyLease));
+            var manifest = await youtube.Videos.Streams.GetManifestAsync(videoId, cancellationToken);
+            proxyLease.Success();
+            return new ResolvedManifest(manifest, proxyLease);
+        }
+        catch (Exception ex)
+        {
+            if (proxyLease.Enabled && MusicHttp.IsProxyFailure(ex))
+                proxyLease.Failure();
+
+            throw;
+        }
+    }
+
+    static string BuildManifestCacheKey(string videoId, MusicProxyLease proxyLease)
+    {
+        string route = proxyLease?.Enabled == true
+            ? $"{proxyLease.Scope}|{proxyLease.Data.ip}|{proxyLease.Data.username}"
+            : "direct";
+
+        return $"{videoId}|{route}|cfg:{MusicProxyService.ConfigurationVersion}";
+    }
+
     static bool ShouldRetryManifestFailure(Exception ex)
     {
         return ex != null
             && ex.GetType().Name == "YoutubeExplodeException"
             && (ex.Message?.IndexOf("cipher manifest", StringComparison.OrdinalIgnoreCase) ?? -1) >= 0;
+    }
+
+    static bool IsPermanentManifestFailure(Exception ex)
+    {
+        for (var current = ex; current != null; current = current.InnerException)
+        {
+            if (current.GetType().Name is "VideoUnavailableException" or "VideoUnplayableException")
+                return true;
+        }
+
+        return false;
     }
 }

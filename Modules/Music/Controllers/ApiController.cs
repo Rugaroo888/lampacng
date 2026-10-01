@@ -1,5 +1,6 @@
 using Microsoft.AspNetCore.Authorization;
 using Microsoft.AspNetCore.Mvc;
+using System.Text;
 
 namespace Music;
 
@@ -11,13 +12,33 @@ public class ApiController : BaseController
     [Route("music/js/{token}")]
     public ActionResult MusicJS(string token)
     {
-        SetHeadersNoCache();
-
         string plugin = FileCache.ReadAllText($"{ModInit.modpath}/plugin.js", "music.js", false)
             .Replace("{localhost}", host)
             .Replace("{client_debug_enabled}", ModInit.conf?.client_debug_enabled == true ? "true" : "false")
             .Replace("{stats_clear_enabled}", ModInit.conf?.stats_clear_enabled == true ? "true" : "false")
-            .Replace("{daily_reset_enabled}", ModInit.conf?.daily_reset_enabled == true ? "true" : "false");
+            .Replace("{daily_reset_enabled}", ModInit.conf?.daily_reset_enabled == true ? "true" : "false")
+            .Replace("{spotify_search_fallback_enabled}", ModInit.conf?.spotify_search_fallback_enabled == true ? "true" : "false");
+
+        // ETag считаем от ИТОГОВОГО текста: ответ зависит не только от plugin.js,
+        // но и от host и флагов конфига выше — хэш исходного файла дал бы ложный
+        // 304 после смены конфигурации и оставил бы клиенту старые значения.
+        // no-cache (не no-store): браузер хранит копию, но перед использованием
+        // перепроверяет её условным запросом — 304 без тела при неизменном файле.
+        string etag = $"\"{Convert.ToHexString(System.Security.Cryptography.SHA256.HashData(Encoding.UTF8.GetBytes(plugin)))[..32].ToLowerInvariant()}\"";
+
+        Response.Headers["Cache-Control"] = "private, no-cache, must-revalidate";
+        Response.Headers["ETag"] = etag;
+
+        string ifNoneMatch = Request.Headers["If-None-Match"].FirstOrDefault();
+        if (!string.IsNullOrEmpty(ifNoneMatch))
+        {
+            foreach (var rawTag in ifNoneMatch.Split(','))
+            {
+                string tag = rawTag.Trim();
+                if (tag == "*" || tag == etag || tag == $"W/{etag}")
+                    return new StatusCodeResult(304);
+            }
+        }
 
         return Content(plugin, "application/javascript; charset=utf-8");
     }
@@ -50,7 +71,7 @@ public class ApiController : BaseController
     {
         string profileId = MusicProfileIdentity.Resolve(requestInfo, Request);
         var result = await MusicCatalogService.GetHomeAsync(profileId, daily_salt ?? 0);
-        MusicImageProxyService.Apply(this, result);
+        result = MusicImageProxyService.Apply(this, result);
         return ContentTo(MusicJson.Serialize(result));
     }
 
@@ -60,8 +81,7 @@ public class ApiController : BaseController
     {
         string profileId = MusicProfileIdentity.Resolve(requestInfo, Request);
         var result = await MusicUserPlaylistService.ListAsync(profileId, HttpContext.RequestAborted);
-        foreach (var playlist in result)
-            MusicImageProxyService.Apply(this, playlist);
+        result = MusicImageProxyService.Apply(this, result);
 
         return ContentTo(MusicJson.Serialize(new { available = true, playlists = result }));
     }
@@ -72,8 +92,7 @@ public class ApiController : BaseController
     {
         string profileId = MusicProfileIdentity.Resolve(requestInfo, Request);
         var tracks = await MusicUserPlaylistService.GetTracksAsync(profileId, id, HttpContext.RequestAborted);
-        foreach (var track in tracks)
-            MusicImageProxyService.Apply(this, track);
+        tracks = MusicImageProxyService.Apply(this, tracks);
 
         return ContentTo(MusicJson.Serialize(new { available = true, playlist_id = id, tracks }));
     }
@@ -103,8 +122,7 @@ public class ApiController : BaseController
     {
         string profileId = MusicProfileIdentity.Resolve(requestInfo, Request);
         var result = await MusicUserPlaylistService.ImportAsync(profileId, url, HttpContext.RequestAborted);
-        foreach (var track in result?.tracks ?? new List<MusicTrack>())
-            MusicImageProxyService.Apply(this, track);
+        result = MusicImageProxyService.Apply(this, result);
 
         return ContentTo(MusicJson.Serialize(result));
     }
@@ -115,8 +133,7 @@ public class ApiController : BaseController
     {
         string profileId = MusicProfileIdentity.Resolve(requestInfo, Request);
         var result = await MusicUserPlaylistService.SyncAsync(profileId, id, HttpContext.RequestAborted);
-        foreach (var track in result?.tracks ?? new List<MusicTrack>())
-            MusicImageProxyService.Apply(this, track);
+        result = MusicImageProxyService.Apply(this, result);
 
         return ContentTo(MusicJson.Serialize(result));
     }
@@ -139,7 +156,7 @@ public class ApiController : BaseController
         bool saved = await MusicUserPlaylistService.AddTrackAsync(profileId, id, parsed, HttpContext.RequestAborted);
         var playlist = saved ? await MusicUserPlaylistService.GetSummaryAsync(profileId, id, HttpContext.RequestAborted) : null;
         if (playlist != null)
-            MusicImageProxyService.Apply(this, playlist);
+            playlist = MusicImageProxyService.Apply(this, playlist);
 
         return ContentTo(MusicJson.Serialize(new { saved, playlist_id = id, playlist }));
     }
@@ -152,7 +169,7 @@ public class ApiController : BaseController
         bool removed = await MusicUserPlaylistService.RemoveTrackAsync(profileId, id, track_id, HttpContext.RequestAborted);
         var playlist = removed ? await MusicUserPlaylistService.GetSummaryAsync(profileId, id, HttpContext.RequestAborted) : null;
         if (playlist != null)
-            MusicImageProxyService.Apply(this, playlist);
+            playlist = MusicImageProxyService.Apply(this, playlist);
 
         return ContentTo(MusicJson.Serialize(new { removed, playlist_id = id, track_id, playlist }));
     }
@@ -165,7 +182,7 @@ public class ApiController : BaseController
         bool moved = await MusicUserPlaylistService.MoveTrackAsync(profileId, id, track_id, position, HttpContext.RequestAborted);
         var playlist = moved ? await MusicUserPlaylistService.GetSummaryAsync(profileId, id, HttpContext.RequestAborted) : null;
         if (playlist != null)
-            MusicImageProxyService.Apply(this, playlist);
+            playlist = MusicImageProxyService.Apply(this, playlist);
 
         return ContentTo(MusicJson.Serialize(new { moved, playlist_id = id, track_id, position, playlist }));
     }
@@ -177,8 +194,7 @@ public class ApiController : BaseController
         string profileId = MusicProfileIdentity.Resolve(requestInfo, Request);
         var result = await MusicDailyMixService.GetMixAsync(profileId, day, salt ?? 0, HttpContext.RequestAborted);
 
-        foreach (var track in result?.tracks ?? new List<MusicTrack>())
-            MusicImageProxyService.Apply(this, track);
+        result = MusicImageProxyService.Apply(this, result);
 
         return ContentTo(MusicJson.Serialize(result));
     }
@@ -189,7 +205,7 @@ public class ApiController : BaseController
     {
         string profileId = MusicProfileIdentity.Resolve(requestInfo, Request);
         var result = await MusicStatsService.GetTopAsync(profileId, limit ?? 30, HttpContext.RequestAborted);
-        MusicImageProxyService.Apply(this, result);
+        result = MusicImageProxyService.Apply(this, result);
 
         return ContentTo(MusicJson.Serialize(result));
     }
@@ -238,8 +254,7 @@ public class ApiController : BaseController
             exclude = parseTracks(exclude, maxExclude)
         }, limit ?? 20, HttpContext.RequestAborted);
 
-        foreach (var track in result?.tracks ?? new List<MusicTrack>())
-            MusicImageProxyService.Apply(this, track);
+        result = MusicImageProxyService.Apply(this, result);
 
         return ContentTo(MusicJson.Serialize(result));
     }
@@ -274,7 +289,7 @@ public class ApiController : BaseController
         if (result == null)
             return ContentTo(MusicJson.Serialize(new { available = false, message = "Section not found." }));
 
-        MusicImageProxyService.Apply(this, result);
+        result = MusicImageProxyService.Apply(this, result);
         return ContentTo(MusicJson.Serialize(result));
     }
 }

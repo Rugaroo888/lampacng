@@ -178,7 +178,7 @@ public class ApiController : BaseController
         var bulder = new StringBuilder();
         bulder = bulder.Append(file);
 
-        if (ModInit.conf.initPlugins.cubProxy)
+        if (ModInit.conf.initPlugins.cubProxy && LampaPluginBuilder.ModuleLoaded("CubProxy"))
         {
             bulder = bulder.Replace("protocol + mirror + '/api/checker'", $"'{host}/cub/api/checker'");
 
@@ -299,83 +299,149 @@ public class ApiController : BaseController
     #endregion
 
     #region Widgets
+    static readonly System.Threading.Lock WidgeLock = new();
+    static readonly System.Threading.Lock IpkLock = new();
+
+    string WidgetHost(string overwritehost)
+    {
+        if (string.IsNullOrWhiteSpace(overwritehost))
+            return host;
+
+        string value = overwritehost.Trim();
+
+        if (!Regex.IsMatch(value, "^https?://", RegexOptions.IgnoreCase))
+            value = "http://" + value;
+
+        if (value.Length > 2048 || !Uri.TryCreate(value, UriKind.Absolute, out Uri uri) ||
+            (uri.Scheme != Uri.UriSchemeHttp && uri.Scheme != Uri.UriSchemeHttps) ||
+            string.IsNullOrWhiteSpace(uri.Host))
+            throw new ArgumentException("overwritehost: invalid URL");
+
+        return uri.GetLeftPart(UriPartial.Authority);
+    }
+
     [HttpGet, AllowAnonymous]
     [Route("samsung.wgt")]
-    public ActionResult SamsWgt(string overwritehost)
+    public ActionResult SamsWgt(string overwritehost, string tizen)
     {
         if (!ModInit.conf.widgets.samsung)
             return NotFound();
 
-        string cache = $"cache/widgets/samsung/{Shared.Services.Utilities.CrypTo.md5(overwritehost ?? host + "v4")}";
-        string wgt = $"{cache}.wgt";
+        SetHeadersNoCache();
 
-        if (IO.File.Exists(wgt))
+        try
+        {
+            string replaceHost = WidgetHost(overwritehost);
+            bool legacy = double.TryParse(tizen, System.Globalization.CultureInfo.InvariantCulture, out double tizenver) && tizenver <= 3;
+
+            string cache = $"cache/widgets/samsung/{Shared.Services.Utilities.CrypTo.md5($"{replaceHost}|v5|{legacy}")}";
+            string wgt = $"{cache}.wgt";
+
+            lock (WidgeLock)
+            {
+                if (!IO.File.Exists(wgt))
+                    BuildSamsWgt(cache, wgt, replaceHost, legacy);
+            }
+
+            Response.Headers["Content-Disposition"] = "attachment; filename=\"samsung.wgt\"";
             return File(IO.File.OpenRead(wgt), "application/octet-stream");
+        }
+        catch (Exception ex)
+        {
+            Serilog.Log.Error(ex, "{Class} {CatchId}", nameof(ApiController), "id_samsung_wgt");
+            return Content($"samsung.wgt build failed: {ex.Message}", "text/plain; charset=utf-8");
+        }
+    }
 
+    void BuildSamsWgt(string cache, string wgt, string replaceHost, bool legacy)
+    {
         var widgetDirectory = $"{ModInit.modpath}/widgets/samsung";
         var publishDirectory = $"{cache}/publish";
 
-        IO.Directory.CreateDirectory(publishDirectory);
-
-        foreach (string inFilePath in IO.Directory.GetFiles(widgetDirectory, "*", IO.SearchOption.AllDirectories))
+        try
         {
-            string outFile = inFilePath.Replace(widgetDirectory, publishDirectory);
-            IO.Directory.CreateDirectory(IO.Path.GetDirectoryName(outFile));
-            IO.File.Copy(inFilePath, outFile, true);
-        }
+            IO.Directory.CreateDirectory(publishDirectory);
 
-        string index = IO.File.ReadAllText($"{publishDirectory}/index.html");
-        IO.File.WriteAllText($"{publishDirectory}/index.html", index.Replace("{localhost}", overwritehost ?? host));
-
-        string loader = IO.File.ReadAllText($"{publishDirectory}/loader.js");
-        IO.File.WriteAllText($"{publishDirectory}/loader.js", loader.Replace("{localhost}", overwritehost ?? host));
-
-        string app = IO.File.ReadAllText($"{publishDirectory}/app.js");
-        IO.File.WriteAllText($"{publishDirectory}/app.js", app.Replace("{localhost}", overwritehost ?? host));
-
-        string gethash(string file)
-        {
-            using (var sha = System.Security.Cryptography.SHA512.Create())
+            foreach (string inFilePath in IO.Directory.GetFiles(widgetDirectory, "*", IO.SearchOption.AllDirectories))
             {
-                return Convert.ToBase64String(sha.ComputeHash(IO.File.ReadAllBytes(file)));
+                string outFile = inFilePath.Replace(widgetDirectory, publishDirectory);
+                IO.Directory.CreateDirectory(IO.Path.GetDirectoryName(outFile));
+                IO.File.Copy(inFilePath, outFile, true);
             }
+
+            string index = IO.File.ReadAllText($"{publishDirectory}/index.html");
+            IO.File.WriteAllText($"{publishDirectory}/index.html", index.Replace("{localhost}", replaceHost));
+
+            string loader = IO.File.ReadAllText($"{publishDirectory}/loader.js");
+            IO.File.WriteAllText($"{publishDirectory}/loader.js", loader.Replace("{localhost}", replaceHost));
+
+            string app = IO.File.ReadAllText($"{publishDirectory}/app.js");
+            IO.File.WriteAllText($"{publishDirectory}/app.js", app.Replace("{localhost}", replaceHost));
+
+            if (legacy)
+            {
+                string config = IO.File.ReadAllText($"{publishDirectory}/config.xml");
+
+
+                config = Regex.Replace(config, @"[ \t]*<tizen:service\b[\s\S]*?</tizen:service>\r?\n", string.Empty);
+                config = Regex.Replace(config, @"[ \t]*<tizen:metadata key=""http://samsung\.com/tv/metadata/use\.preview""[^>]*>\r?\n", string.Empty);
+
+                if (config.Contains("tizen:service") || config.Contains("use.preview"))
+                    throw new InvalidOperationException("legacy tizen: не удалось вырезать tizen:service из config.xml");
+
+                IO.File.WriteAllText($"{publishDirectory}/config.xml", config);
+            }
+
+            string gethash(string file)
+            {
+                using (var sha = System.Security.Cryptography.SHA512.Create())
+                {
+                    return Convert.ToBase64String(sha.ComputeHash(IO.File.ReadAllBytes(file)));
+                }
+            }
+
+            string indexhashsha512 = gethash($"{publishDirectory}/index.html");
+            string loaderhashsha512 = gethash($"{publishDirectory}/loader.js");
+            string apphashsha512 = gethash($"{publishDirectory}/app.js");
+            string confighashsha512 = gethash($"{publishDirectory}/config.xml");
+            string iconhashsha512 = gethash($"{publishDirectory}/icon.png");
+            string logohashsha512 = gethash($"{publishDirectory}/logo_appname_fg.png");
+
+            string author_sigxml = IO.File.ReadAllText($"{widgetDirectory}/author-signature.xml");
+            author_sigxml = author_sigxml
+                .Replace("loaderhashsha512", loaderhashsha512)
+                .Replace("apphashsha512", apphashsha512)
+                .Replace("iconhashsha512", iconhashsha512)
+                .Replace("logohashsha512", logohashsha512)
+                .Replace("confighashsha512", confighashsha512)
+                .Replace("indexhashsha512", indexhashsha512);
+
+            IO.File.WriteAllText($"{publishDirectory}/author-signature.xml", author_sigxml);
+
+            string authorsignaturehashsha512 = gethash($"{publishDirectory}/author-signature.xml");
+            string sigxml1 = IO.File.ReadAllText($"{publishDirectory}/signature1.xml");
+            sigxml1 = sigxml1
+                .Replace("loaderhashsha512", loaderhashsha512)
+                .Replace("apphashsha512", apphashsha512)
+                .Replace("confighashsha512", confighashsha512)
+                .Replace("authorsignaturehashsha512", authorsignaturehashsha512)
+                .Replace("iconhashsha512", iconhashsha512)
+                .Replace("logohashsha512", logohashsha512)
+                .Replace("indexhashsha512", indexhashsha512);
+
+            IO.File.WriteAllText($"{publishDirectory}/signature1.xml", sigxml1);
+
+            IO.Compression.ZipFile.CreateFromDirectory(publishDirectory, $"{wgt}.tmp");
+            IO.File.Move($"{wgt}.tmp", wgt, true);
         }
+        finally
+        {
+            if (IO.Directory.Exists(cache))
+                IO.Directory.Delete(cache, true);
 
-        string indexhashsha512 = gethash($"{publishDirectory}/index.html");
-        string loaderhashsha512 = gethash($"{publishDirectory}/loader.js");
-        string apphashsha512 = gethash($"{publishDirectory}/app.js");
-        string confighashsha512 = gethash($"{publishDirectory}/config.xml");
-        string iconhashsha512 = gethash($"{publishDirectory}/icon.png");
-        string logohashsha512 = gethash($"{publishDirectory}/logo_appname_fg.png");
-
-        string author_sigxml = IO.File.ReadAllText($"{widgetDirectory}/author-signature.xml");
-        author_sigxml = author_sigxml
-            .Replace("loaderhashsha512", loaderhashsha512)
-            .Replace("apphashsha512", apphashsha512)
-            .Replace("iconhashsha512", iconhashsha512)
-            .Replace("logohashsha512", logohashsha512)
-            .Replace("confighashsha512", confighashsha512)
-            .Replace("indexhashsha512", indexhashsha512);
-
-        IO.File.WriteAllText($"{publishDirectory}/author-signature.xml", author_sigxml);
-
-        string authorsignaturehashsha512 = gethash($"{publishDirectory}/author-signature.xml");
-        string sigxml1 = IO.File.ReadAllText($"{publishDirectory}/signature1.xml");
-        sigxml1 = sigxml1
-            .Replace("loaderhashsha512", loaderhashsha512)
-            .Replace("apphashsha512", apphashsha512)
-            .Replace("confighashsha512", confighashsha512)
-            .Replace("authorsignaturehashsha512", authorsignaturehashsha512)
-            .Replace("iconhashsha512", iconhashsha512)
-            .Replace("logohashsha512", logohashsha512)
-            .Replace("indexhashsha512", indexhashsha512);
-
-        IO.File.WriteAllText($"{publishDirectory}/signature1.xml", sigxml1);
-        IO.Compression.ZipFile.CreateFromDirectory(publishDirectory, wgt);
-
-        IO.Directory.Delete(cache, true);
-
-        return File(IO.File.OpenRead(wgt), "application/octet-stream");
+            if (IO.File.Exists($"{wgt}.tmp"))
+                IO.File.Delete($"{wgt}.tmp");
+        }
     }
 
     [HttpGet]
@@ -386,20 +452,45 @@ public class ApiController : BaseController
         if (!ModInit.conf.widgets.lg)
             return NotFound();
 
-        string cache = $"cache/widgets/lg/{Shared.Services.Utilities.CrypTo.md5(overwritehost ?? host + "v01")}";
-        string ipk = $"{cache}.ipk";
+        SetHeadersNoCache();
 
-        if (IO.File.Exists(ipk))
+        try
+        {
+            string replaceHost = WidgetHost(overwritehost);
+
+            string cache = $"cache/widgets/lg/{Shared.Services.Utilities.CrypTo.md5($"{replaceHost}|v02")}";
+            string ipk = $"{cache}.ipk";
+
+            if (!IO.File.Exists(ipk))
+            {
+                var widgetDirectory = $"{ModInit.modpath}/widgets/lg";
+
+                if (!IO.Directory.Exists(widgetDirectory) ||
+                    !IO.Directory.Exists($"{widgetDirectory}/app") ||
+                    !IO.File.Exists($"{widgetDirectory}/service.tar.gz") ||
+                    !IO.File.Exists($"{widgetDirectory}/control/control"))
+                    return NotFound();
+
+                lock (IpkLock)
+                {
+                    if (!IO.File.Exists(ipk))
+                        BuildLgIpk(ipk, replaceHost);
+                }
+            }
+
+            Response.Headers["Content-Disposition"] = "attachment; filename=\"lg.ipk\"";
             return File(IO.File.OpenRead(ipk), "application/octet-stream");
+        }
+        catch (Exception ex)
+        {
+            Serilog.Log.Error(ex, "{Class} {CatchId}", nameof(ApiController), "id_lg_ipk");
+            return Content($"lg.ipk build failed: {ex.Message}", "text/plain; charset=utf-8");
+        }
+    }
 
+    void BuildLgIpk(string ipk, string replaceHost)
+    {
         var widgetDirectory = $"{ModInit.modpath}/widgets/lg";
-        if (!IO.Directory.Exists(widgetDirectory))
-            return NotFound();
-
-        if (!IO.Directory.Exists($"{widgetDirectory}/app") ||
-            !IO.File.Exists($"{widgetDirectory}/service.tar.gz") ||
-            !IO.File.Exists($"{widgetDirectory}/control/control"))
-            return NotFound();
 
         const string appId = "com.lampac.tv";
         const string serviceId = appId + ".worker";
@@ -407,7 +498,6 @@ public class ApiController : BaseController
         string appSource = $"{widgetDirectory}/app";
         string serviceArchive = $"{widgetDirectory}/service.tar.gz";
         string controlSource = $"{widgetDirectory}/control";
-        string replaceHost = overwritehost ?? host;
 
         #region packageinfo.json (mandatory for webOS)
         string appVersion = "1.0.0";
@@ -511,16 +601,26 @@ public class ApiController : BaseController
 
         IO.Directory.CreateDirectory(IO.Path.GetDirectoryName(ipk));
 
-        using (var stream = IO.File.Create(ipk))
-        using (var writer = new IO.BinaryWriter(stream, Encoding.ASCII, leaveOpen: false))
+        try
         {
-            writer.Write(Encoding.ASCII.GetBytes("!<arch>\n"));
-            WriteArFile(writer, "debian-binary", debianBinary);
-            WriteArFile(writer, "control.tar.gz", controlTarGz);
-            WriteArFile(writer, "data.tar.gz", dataTarGz);
+            using (var stream = IO.File.Create($"{ipk}.tmp"))
+            using (var writer = new IO.BinaryWriter(stream, Encoding.ASCII, leaveOpen: false))
+            {
+                writer.Write(Encoding.ASCII.GetBytes("!<arch>\n"));
+                WriteArFile(writer, "debian-binary", debianBinary);
+                WriteArFile(writer, "control.tar.gz", controlTarGz);
+                WriteArFile(writer, "data.tar.gz", dataTarGz);
+            }
+
+            IO.File.Move($"{ipk}.tmp", ipk, true);
+        }
+        finally
+        {
+            if (IO.File.Exists($"{ipk}.tmp"))
+                IO.File.Delete($"{ipk}.tmp");
         }
 
-        return File(IO.File.OpenRead(ipk), "application/octet-stream");
+        return;
 
         static byte[] BuildTarGz(Action<TarWriter> write)
         {
@@ -597,64 +697,9 @@ public class ApiController : BaseController
             sb = sb.Append(lampainitjs);
 
             #region plugins
-            List<LampaPlugin> plugins = new(20);
-
-            if (ModInit.conf.initPlugins.dlna)
-                plugins.Add(new("{localhost}/dlna.js", 1, "DLNA", "lampac"));
-
-            if (ModInit.conf.initPlugins.tracks)
-                plugins.Add(new("{localhost}/tracks.js", 1, "Tracks.js", "lampac"));
-
-            if (ModInit.conf.initPlugins.transcoding)
-                plugins.Add(new("{localhost}/transcoding.js", 1, "Transcoding video", "lampac"));
-
-            if (ModInit.conf.initPlugins.tmdbProxy)
-                plugins.Add(new("{localhost}/tmdbproxy.js", 1, "TMDB Proxy", "lampac"));
-
-            if (ModInit.conf.initPlugins.cubProxy)
-                plugins.Add(new("{localhost}/cubproxy.js", 1, "CUB Proxy", "lampac"));
-
-            if (ModInit.conf.initPlugins.online)
-                plugins.Add(new("{localhost}/online.js", 1, "Онлайн", "lampac"));
-
-            if (ModInit.conf.initPlugins.watch_together)
-                plugins.Add(new("{localhost}/watchtogether.js", 1, "Watch Together", "lampac"));
-
-            if (ModInit.conf.initPlugins.catalog)
-                plugins.Add(new("{localhost}/catalog.js", 1, "Альтернативные источники каталога", "lampac"));
-
-            if (ModInit.conf.initPlugins.dorama)
-                plugins.Add(new("{localhost}/dorama.js", 1, "Дорамы", "lampac"));
-
-            if (ModInit.conf.initPlugins.sisi)
-            {
-                plugins.Add(new("{localhost}/sisi.js", 1, "Клубничка", "lampac"));
-                plugins.Add(new("{localhost}/startpage.js", 1, "Стартовая страница", "lampac"));
-            }
-
-            if (ModInit.conf.initPlugins.sync)
-                plugins.Add(new("{localhost}/sync.js", 1, "Синхронизация", "lampac"));
-
-            if (ModInit.conf.initPlugins.timecode)
-                plugins.Add(new("{localhost}/timecode.js", 1, "Синхронизация тайм-кодов", "lampac"));
-
-            if (ModInit.conf.initPlugins.bookmark)
-                plugins.Add(new("{localhost}/bookmark.js", 1, "Синхронизация закладок", "lampac"));
-
-            if (ModInit.conf.initPlugins.torrserver)
-                plugins.Add(new("{localhost}/ts.js", 1, "TorrServer", "lampac"));
-
-            if (ModInit.conf.initPlugins.backup)
-                plugins.Add(new("{localhost}/backup.js", 1, "Backup", "lampac"));
-
-            if (ModInit.conf.customPlugins != null)
-            {
-                foreach (var p in ModInit.conf.customPlugins)
-                {
-                    if (p.status == 1)
-                        plugins.Add(p);
-                }
-            }
+            var plugins = LampaPluginBuilder.BuildInitPlugins(
+                ModInit.conf.initPlugins,
+                ModInit.conf.customPlugins);
 
             sb = sb.Replace("{initiale}", JsonConvert.SerializeObject(plugins));
             #endregion
@@ -670,14 +715,26 @@ public class ApiController : BaseController
 
             if (CoreInit.conf.accsdb.enable)
             {
-                string denyjs = FileCache.ReadAllText($"{ModInit.modpath}/plugins/deny.js", "deny.js");
-                if (denyjs.Contains("{country}"))
-                    StatiCacheDisabled = true;
+                string script;
+                var gate = ModInit.conf.telegramAuthGate;
+                if (gate != null && gate.enabled && !string.IsNullOrWhiteSpace(gate.botUsername))
+                {
+                    script = TelegramGateJs();
+                }
+                else
+                {
+                    if (gate != null && gate.enabled && string.IsNullOrWhiteSpace(gate.botUsername))
+                        Console.WriteLine("LampaWeb.telegramAuthGate: enabled=true, но botUsername пустой — откат на deny.js (гейт без имени бота неавторизуем).");
 
-                if (denyjs.Contains("{cubMesage}"))
-                    denyjs = denyjs.Replace("{cubMesage}", CoreInit.conf.accsdb.authMesage);
+                    script = FileCache.ReadAllText($"{ModInit.modpath}/plugins/deny.js", "deny.js");
+                    if (script.Contains("{country}"))
+                        StatiCacheDisabled = true;
 
-                sb = sb.Replace("{deny}", denyjs);
+                    if (script.Contains("{cubMesage}"))
+                        script = script.Replace("{cubMesage}", CoreInit.conf.accsdb.authMesage);
+                }
+
+                sb = sb.Replace("{deny}", script);
             }
 
             string initinvcjs = FileCache.ReadAllText($"{ModInit.modpath}/plugins/lampainit-invc.js", "lampainit-invc.js");
@@ -692,7 +749,7 @@ public class ApiController : BaseController
 
             sb = sb.Replace("{ major: 0, minor: 0 }", $"{{major: 2, minor: 1}}");
 
-            if (ModInit.conf.initPlugins.jacred)
+            if (ModInit.conf.initPlugins.jacred && LampaPluginBuilder.ModuleLoaded("JacRed"))
                 sb = sb.Replace("{jachost}", Regex.Replace(host, "^https?://", ""));
             else
                 sb = sb.Replace("{jachost}", "jac.red");
@@ -773,73 +830,11 @@ public class ApiController : BaseController
             if (adult && HttpContext.Request.Path.Value.StartsWith("/on/h/"))
                 adult = false;
 
-            var plugins = new List<string>(15);
-
-            void send(string name, bool worktoken)
-            {
-                if (worktoken && !string.IsNullOrEmpty(token))
-                {
-                    plugins.Add($"\"{{localhost}}/{name}/js/{HttpUtility.UrlEncode(token)}\"");
-                }
-                else
-                {
-                    plugins.Add($"\"{{localhost}}/{name}.js\"");
-                }
-            }
-
-            if (ModInit.conf.initPlugins.dlna)
-                send("dlna", true);
-
-            if (ModInit.conf.initPlugins.tracks)
-                send("tracks", true);
-
-            if (ModInit.conf.initPlugins.transcoding)
-                send("transcoding", true);
-
-            if (ModInit.conf.initPlugins.tmdbProxy)
-                send("tmdbproxy", true);
-
-            if (ModInit.conf.initPlugins.cubProxy)
-                send("cubproxy", true);
-
-            if (ModInit.conf.initPlugins.dorama)
-                send("dorama", true);
-
-            if (ModInit.conf.initPlugins.online)
-                send("online", true);
-
-            if (ModInit.conf.initPlugins.watch_together)
-                send("watchtogether", false);
-
-            if (adult && ModInit.conf.initPlugins.sisi)
-            {
-                send("sisi", true);
-                send("startpage", false);
-            }
-
-            if (ModInit.conf.initPlugins.sync)
-                send("sync", true);
-
-            if (ModInit.conf.initPlugins.timecode)
-                send("timecode", true);
-
-            if (ModInit.conf.initPlugins.bookmark)
-                send("bookmark", true);
-
-            if (ModInit.conf.initPlugins.torrserver)
-                send("ts", true);
-
-            if (ModInit.conf.initPlugins.backup)
-                send("backup", true);
-
-            if (ModInit.conf.customPlugins != null)
-            {
-                foreach (var p in ModInit.conf.customPlugins)
-                {
-                    if (p.status == 1)
-                        plugins.Add($"\"{p.url}\"");
-                }
-            }
+            var plugins = LampaPluginBuilder.BuildOnPluginUrls(
+                ModInit.conf.initPlugins,
+                ModInit.conf.customPlugins,
+                token,
+                adult);
             #endregion
 
             string onjs = FileCache.ReadAllText($"{ModInit.modpath}/plugins/on.js", "on.js");
@@ -883,7 +878,7 @@ public class ApiController : BaseController
             sb.Append(privateinit)
               .Replace("{country}", requestInfo.Country ?? string.Empty)
               .Replace("{localhost}", host)
-              .Replace("{jachost}", ModInit.conf.initPlugins.jacred ? Regex.Replace(host, "^https?://", "") : "jac.red");
+              .Replace("{jachost}", ModInit.conf.initPlugins.jacred && LampaPluginBuilder.ModuleLoaded("JacRed") ? Regex.Replace(host, "^https?://", "") : "jac.red");
 
             return ContentTo(sb, "application/javascript; charset=utf-8");
         }
@@ -894,6 +889,22 @@ public class ApiController : BaseController
     }
     #endregion
 
+    private string TelegramGateJs()
+    {
+        var g = ModInit.conf.telegramAuthGate;
+        string raw = FileCache.ReadAllText($"{ModInit.modpath}/plugins/telegram_auth_gate.js", "telegram_auth_gate.js");
+        if (raw.Contains("{country}"))
+            StatiCacheDisabled = true; // defensive parity с deny.js; в файле гейта {country} нет
+
+        string bot = HttpUtility.JavaScriptStringEncode(g?.botUsername ?? string.Empty);
+        string svc = HttpUtility.JavaScriptStringEncode(g?.serviceName ?? string.Empty);
+
+        // {localhost}, {country}, {token} подставляются глобально (688-689, 738-748) или в маршруте
+        return raw
+            .Replace("{botUsername}", bot)
+            .Replace("{serviceName}", svc);
+    }
+
     #region telegram_auth_gate.js
     [HttpGet, AllowAnonymous, Staticache(manually: true)]
     [Route("telegram_auth_gate.js")]
@@ -901,9 +912,14 @@ public class ApiController : BaseController
     {
         SetHeadersNoCache();
 
-        string gate = FileCache.ReadAllText($"{ModInit.modpath}/plugins/telegram_auth_gate.js", "telegram_auth_gate.js")
-            .Replace("{country}", requestInfo.Country)
-            .Replace("{localhost}", host);
+        string token = string.IsNullOrEmpty(CoreInit.conf.accsdb.domainId_pattern)
+            ? string.Empty
+            : Regex.Match(HttpContext.Request.Host.Host, CoreInit.conf.accsdb.domainId_pattern).Groups[1].Value;
+
+        string gate = TelegramGateJs()
+            .Replace("{country}", requestInfo.Country ?? string.Empty)
+            .Replace("{localhost}", host)
+            .Replace("{token}", HttpUtility.UrlEncode(token));
 
         return ContentTo(gate, "application/javascript; charset=utf-8");
     }

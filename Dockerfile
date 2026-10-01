@@ -2,8 +2,8 @@
 # Build with: docker buildx build --platform linux/amd64,linux/arm64 -f Dockerfile .
 
 # Global ARGs
-ARG DOTNET_VERSION=10.0.10
-ARG DOTNET_SDK_VERSION=10.0.302
+ARG DOTNET_VERSION=10.0.12
+ARG DOTNET_SDK_VERSION=10.0.401
 
 # Builder image — platform set by buildx
 FROM --platform=$BUILDPLATFORM debian:13-slim AS builder
@@ -12,6 +12,12 @@ ARG BUILDARCH
 ARG TARGETARCH
 ARG DOTNET_VERSION
 ARG DOTNET_SDK_VERSION
+ARG LAMPAC_VERSION=dev
+ARG GIT_COMMIT=
+ARG GITHUB_SERVER_URL
+ARG GITHUB_REPOSITORY
+ARG GITHUB_REF
+ARG GITHUB_RUN_ID
 
 RUN mkdir -p /out
 
@@ -55,7 +61,7 @@ RUN case "$BUILDARCH" in \
     && tar -oxzf /tmp/dotnet-sdk.tar.gz -C /out/usr/share/dotnet \
     && rm /tmp/dotnet-sdk.tar.gz \
     # Build the application
-    && DOTNET_CLI_TELEMETRY_OPTOUT=1 /out/usr/share/dotnet/dotnet publish --configuration Release --runtime "$RID" --output /out/lampac -p:PlaywrightPlatform="$RID" Core/Core.csproj \
+    && DOTNET_CLI_TELEMETRY_OPTOUT=1 /out/usr/share/dotnet/dotnet publish --configuration Release --runtime "$RID" --output /out/lampac -p:PlaywrightPlatform="$RID" -p:InformationalVersion="$LAMPAC_VERSION" -p:SourceRevisionId="$GIT_COMMIT" Core/Core.csproj \
     # Replace SDK with ASP.NET Core runtime for the final image
     && rm -rf /out/usr/share/dotnet \
     && mkdir -p /out/usr/share/dotnet \
@@ -78,7 +84,7 @@ FROM debian:13-slim AS runner
 ARG TARGETARCH
 
 LABEL org.opencontainers.image.description="Lampac NextGen - Media aggregator" \
-    org.opencontainers.image.licenses="MIT" \
+    org.opencontainers.image.licenses="AGPL-3.0-only" \
     org.opencontainers.image.source="https://github.com/lampac-nextgen/lampac" \
     org.opencontainers.image.vendor="Lampac NextGen"
 
@@ -86,9 +92,7 @@ ENV DOTNET_ROOT=/usr/share/dotnet \
     PATH="${PATH}:/usr/share/dotnet" \
     DOTNET_RUNNING_IN_CONTAINER=true \
     DOTNET_SYSTEM_GLOBALIZATION_INVARIANT=false \
-    DOTNET_CLI_TELEMETRY_OPTOUT=1 \
-    CHROMIUM_PATH=/usr/bin/google-chrome-stable \
-    CHROMIUM_FLAGS="--no-sandbox --disable-setuid-sandbox --disable-dev-shm-usage"
+    DOTNET_CLI_TELEMETRY_OPTOUT=1
 
 WORKDIR /lampac
 EXPOSE 9118
@@ -114,6 +118,9 @@ RUN apt-get update \
     libnspr4 \
     libpng-dev \
     libwebp-dev \
+    xvfb \
+    && mkdir -p /tmp/.X11-unix \
+    && chmod 1777 /tmp/.X11-unix \
     && case "$TARGETARCH" in \
     arm64) CHROME_URL="https://dl.google.com/linux/direct/google-chrome-stable_current_arm64.deb" ;; \
     amd64) CHROME_URL="https://dl.google.com/linux/direct/google-chrome-stable_current_amd64.deb" ;; \

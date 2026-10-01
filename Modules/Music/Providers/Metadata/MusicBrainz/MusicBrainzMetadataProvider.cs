@@ -6,7 +6,8 @@ namespace Music;
 
 public class MusicBrainzMetadataProvider : IMusicMetadataProvider
 {
-    static readonly HttpClient httpClient = FriendlyHttp.CreateHttpClient(useCookies: false);
+    static readonly HttpClient httpClient = MusicHttp.CreateClient("musicbrainz");
+    static readonly TimeSpan requestTimeout = TimeSpan.FromSeconds(20);
     static readonly SemaphoreSlim requestGate = new(1, 1);
     static DateTime nextRequestAt = DateTime.MinValue;
 
@@ -19,7 +20,7 @@ public class MusicBrainzMetadataProvider : IMusicMetadataProvider
 
     static MusicBrainzMetadataProvider()
     {
-        httpClient.Timeout = TimeSpan.FromSeconds(20);
+        httpClient.Timeout = requestTimeout;
     }
 
     public async Task<MusicSearchResult> SearchAsync(string query, bool expanded = false, CancellationToken cancellationToken = default)
@@ -141,7 +142,7 @@ public class MusicBrainzMetadataProvider : IMusicMetadataProvider
 
     public async Task<MusicAlbum> GetAlbumAsync(string id, CancellationToken cancellationToken = default)
     {
-        var releaseJson = await GetJsonAsync($"release/{HttpUtility.UrlEncode(id)}?inc=recordings+artist-credits+release-groups+media&fmt=json", cancellationToken);
+        var releaseJson = await GetJsonAsync($"release/{HttpUtility.UrlEncode(id)}?inc=recordings+artist-credits+release-groups+media+isrcs&fmt=json", cancellationToken);
         if (releaseJson != null)
             return ParseAlbumFromRelease(releaseJson);
 
@@ -159,7 +160,7 @@ public class MusicBrainzMetadataProvider : IMusicMetadataProvider
             if (string.IsNullOrWhiteSpace(releaseId))
                 continue;
 
-            releaseJson = await GetJsonAsync($"release/{HttpUtility.UrlEncode(releaseId)}?inc=recordings+artist-credits+release-groups+media&fmt=json", cancellationToken);
+            releaseJson = await GetJsonAsync($"release/{HttpUtility.UrlEncode(releaseId)}?inc=recordings+artist-credits+release-groups+media+isrcs&fmt=json", cancellationToken);
             if (releaseJson == null)
                 continue;
 
@@ -183,7 +184,7 @@ public class MusicBrainzMetadataProvider : IMusicMetadataProvider
 
     public async Task<MusicTrack> GetTrackAsync(string id, CancellationToken cancellationToken = default)
     {
-        var trackJson = await GetJsonAsync($"recording/{HttpUtility.UrlEncode(id)}?inc=artist-credits+releases&fmt=json", cancellationToken);
+        var trackJson = await GetJsonAsync($"recording/{HttpUtility.UrlEncode(id)}?inc=artist-credits+releases+isrcs&fmt=json", cancellationToken);
         return trackJson == null ? null : ParseTrack(trackJson);
     }
 
@@ -192,20 +193,46 @@ public class MusicBrainzMetadataProvider : IMusicMetadataProvider
         if (string.IsNullOrWhiteSpace(path))
             return null;
 
-        await RespectRateLimitAsync(cancellationToken);
+        using var timeoutCts = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
+        timeoutCts.CancelAfter(requestTimeout);
+        var token = timeoutCts.Token;
+        long started = System.Diagnostics.Stopwatch.GetTimestamp();
 
         try
         {
-            using var request = new HttpRequestMessage(HttpMethod.Get, $"{baseUrl}/{path}");
-            request.Headers.TryAddWithoutValidation("User-Agent", userAgent);
-            request.Headers.TryAddWithoutValidation("Accept", "application/json");
+            for (int attempt = 0; attempt < 2; attempt++)
+            {
+                await RespectRateLimitAsync(token);
 
-            using var response = await httpClient.SendAsync(request, cancellationToken);
-            if (!response.IsSuccessStatusCode)
-                return null;
+                TimeSpan delay;
+                using (var request = new HttpRequestMessage(HttpMethod.Get, $"{baseUrl}/{path}"))
+                {
+                    request.Headers.TryAddWithoutValidation("User-Agent", userAgent);
+                    request.Headers.TryAddWithoutValidation("Accept", "application/json");
 
-            var json = await response.Content.ReadAsStringAsync(cancellationToken);
-            return JsonNode.Parse(json) as JsonObject;
+                    using var response = await httpClient.SendAsync(request, token);
+                    if (response.IsSuccessStatusCode)
+                    {
+                        var json = await response.Content.ReadAsStringAsync(token);
+                        return JsonNode.Parse(json) as JsonObject;
+                    }
+
+                    if (attempt != 0 || (int)response.StatusCode is not (429 or 502 or 503 or 504))
+                        return null;
+
+                    var retryAfter = response.Headers.RetryAfter;
+                    delay = retryAfter?.Delta
+                        ?? (retryAfter?.Date is DateTimeOffset retryAt ? retryAt - DateTimeOffset.UtcNow : TimeSpan.Zero);
+                    if (delay < TimeSpan.Zero) delay = TimeSpan.Zero;
+                }
+
+                // Never shorten Retry-After or give the retry a fresh timeout budget.
+                var remaining = requestTimeout - System.Diagnostics.Stopwatch.GetElapsedTime(started);
+                if (delay >= remaining) return null;
+                if (delay > TimeSpan.Zero) await Task.Delay(delay, token);
+            }
+
+            return null;
         }
         catch (OperationCanceledException) when (!cancellationToken.IsCancellationRequested)
         {
@@ -351,6 +378,7 @@ public class MusicBrainzMetadataProvider : IMusicMetadataProvider
             artists = ParseArtistNames(artistCredit),
             album_id = release?["id"]?.GetValue<string>(),
             album_title = release?["title"]?.GetValue<string>(),
+            isrc = ParseIsrc(item["isrcs"] as JsonArray),
             duration_ms = item["length"]?.GetValue<int?>(),
             date = release?["date"]?.GetValue<string>(),
             search_score = ParseInt(item["score"]),
@@ -420,6 +448,7 @@ public class MusicBrainzMetadataProvider : IMusicMetadataProvider
                         artists = ParseArtistNames(trackArtistCredit),
                         album_id = album.id,
                         album_title = album.title,
+                        isrc = ParseIsrc(recording?["isrcs"] as JsonArray),
                         duration_ms = recording?["length"]?.GetValue<int?>() ?? trackNode["length"]?.GetValue<int?>(),
                         track_number = ParseInt(trackNode["number"]),
                         disc_number = discNumber,
@@ -1483,6 +1512,24 @@ public class MusicBrainzMetadataProvider : IMusicMetadataProvider
             .Where(item => !string.IsNullOrWhiteSpace(item))
             .Distinct(StringComparer.OrdinalIgnoreCase)
             .ToList();
+    }
+
+    static string ParseIsrc(JsonArray values)
+    {
+        if (values == null)
+            return null;
+
+        foreach (var item in values.OfType<JsonValue>())
+        {
+            if (item.TryGetValue<string>(out var value))
+            {
+                string isrc = MusicIsrc.Normalize(value);
+                if (isrc != null)
+                    return isrc;
+            }
+        }
+
+        return null;
     }
 
     static int? ParseYear(string date)

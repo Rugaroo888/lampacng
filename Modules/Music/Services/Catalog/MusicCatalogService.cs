@@ -23,7 +23,10 @@ public static class MusicCatalogService
     // отдельными artistsection-запросами вместо короткого overview.
     // v35: уточнённые Spotify release labels для singles/EP/appears-on.
     // v36: Spotify singles/EP отдаются как track-section, не album-section.
-    const string metadataCacheVersion = "v36";
+    // v37: track metadata сохраняет ISRC для точного audio matching.
+    // v38: Spotify tracks сохраняют album_id для быстрого нативного
+    // разрешения длительности без ошибочного fallback в MusicBrainz.
+    const string metadataCacheVersion = "v38";
     static readonly object homeWarmLock = new();
     static readonly Dictionary<string, Task<List<MusicBrowseSection>>> homeWarmTasks = new(StringComparer.OrdinalIgnoreCase);
 
@@ -189,15 +192,22 @@ public static class MusicCatalogService
                 () => SpotifySupport.GetArtistAsync(id, cancellationToken), cancellationToken);
 
         var metadata = MusicProviderRegistry.GetMetadataProvider(provider);
+        bool isMusicBrainz = metadata is MusicBrainzMetadataProvider;
         return metadata == null
             ? Task.FromResult<MusicArtist>(null)
             : MusicMetadataCacheService.GetOrCreateAsync(
                 metadata.Id,
                 "artist",
-                VersionedKey(id),
+                // Bypass old week-long empty discographies without invalidating other caches.
+                VersionedKey(isMusicBrainz ? $"artist-discography:v2:{id}" : id),
                 artistCacheTtl,
                 () => metadata.GetArtistAsync(id, cancellationToken),
-                cancellationToken
+                cancellationToken,
+                ttlSelector: artist => isMusicBrainz
+                    && (artist.albums?.Count ?? 0) == 0
+                    && (artist.sections?.Count ?? 0) == 0
+                        ? TimeSpan.FromMinutes(20)
+                        : artistCacheTtl
             );
     }
 
@@ -223,6 +233,37 @@ public static class MusicCatalogService
     {
         if (YouTubeMusicSearchSupport.IsPlaylistAlbum(provider, id))
             return YouTubeMusicSearchSupport.GetPlaylistAlbumAsync(id, cancellationToken);
+
+        if (AppleMusicSupport.IsCatalogAlbum(provider, id))
+            return MusicMetadataCacheService.GetOrCreateAsync(
+                AppleMusicSupport.ProviderId, "album", VersionedKey(id), albumCacheTtl,
+                () => AppleMusicSupport.GetCatalogAlbumAsync(id, cancellationToken), cancellationToken);
+
+        if (AppleMusicDiscoveryProvider.IsChartAlbum(provider, id))
+        {
+            var discovery = MusicProviderRegistry.DiscoveryProviders
+                .FirstOrDefault(i => string.Equals(i.Id, AppleMusicDiscoveryProvider.ProviderId, StringComparison.OrdinalIgnoreCase)) as AppleMusicDiscoveryProvider;
+
+            return discovery?.Enabled == true
+                ? MusicMetadataCacheService.GetOrCreateAsync(
+                    AppleMusicDiscoveryProvider.ProviderId,
+                    "album",
+                    VersionedKey($"{AppleMusicDiscoveryProvider.CurrentCountry}|{id}"),
+                    albumCacheTtl,
+                    () => discovery.GetAlbumAsync(id, cancellationToken),
+                    cancellationToken)
+                : Task.FromResult<MusicAlbum>(null);
+        }
+
+        if (SpotifyDiscoveryProvider.IsPlaylistAlbum(provider, id))
+        {
+            var discovery = MusicProviderRegistry.DiscoveryProviders
+                .FirstOrDefault(i => string.Equals(i.Id, provider, StringComparison.OrdinalIgnoreCase)) as SpotifyDiscoveryProvider;
+
+            return discovery?.Enabled == true
+                ? discovery.GetPlaylistAlbumAsync(id, cancellationToken)
+                : Task.FromResult<MusicAlbum>(null);
+        }
 
         if (SoundCloudSupport.IsUserTracksAlbum(provider, id))
             return SoundCloudSupport.GetUserTracksAlbumAsync(id, cancellationToken);
@@ -475,7 +516,11 @@ public static class MusicCatalogService
 
     static bool ShouldSkipMetadataTrackLookup(string id, string provider)
     {
-        if (StartsWithAny(id, "inline:", "youtube:", "sefon:", "soundcloud:"))
+        // Spotify здесь является каталогом/источником discovery, но не
+        // IMusicMetadataProvider. Без этого gate GetMetadataProvider("spotify")
+        // откатывается на дефолтный MusicBrainz и до его сетевого таймаута
+        // пытается найти там spotify:track:* перед каждым первым запуском.
+        if (StartsWithAny(id, "inline:", "youtube:", "sefon:", "soundcloud:", "spotify:"))
             return true;
 
         return !string.IsNullOrWhiteSpace(provider)

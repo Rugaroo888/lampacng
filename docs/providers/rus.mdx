@@ -1,0 +1,56 @@
+---
+title: "Российские VOD-провайдеры (OnlineRUS)"
+sidebarTitle: "OnlineRUS"
+description: "24 российских CDN группы OnlineRUS: Collaps, Mirage, HDVB, Gencit, RuDub и другие."
+keywords: ["OnlineRUS", "Collaps", "Mirage", "HDVB", "Gencit", "Kinoteatrkg", "RuDub"]
+---
+
+Группа `OnlineRUS` загружается с модулем Online. Отключите всю группу через `SkipModules: ["OnlineRUS"]`.
+
+| Провайдер | Примечания |
+| --- | --- |
+| `CDNvideohub` | CDN |
+| `Collaps` | Обычный и DASH |
+| `FanCDN` | fanserial |
+| `FlixCDN` | Фильмы и сериалы; выключен по умолчанию |
+| `Gencit` | `/lite/gencit` |
+| `HDVB` | Балансер |
+| `Kinobase` | Релизы |
+| `Kinogo` | Классический источник |
+| `Kinoteatrkg` | Фильмы, `/lite/kinoteatrkg` |
+| `Kinotochka` | Разнообразный контент |
+| `LeProduction` | Производственный контент |
+| `Mirage` | Мультиозвучка |
+| `Phantom` | Регулярные обновления |
+| `PizdatoeHD` | HD |
+| `RuDub` | Сериалы, `/lite/rudub`; `streamproxy: false`, `httptimeout` 6 |
+| `RutubeMovie` | Rutube |
+| `Spectre` | Актуальные релизы |
+| `VeoVeo` | Офлайн `data/veoveo.json` |
+| `Vibix` | Библиотека |
+| `VideoDB` / `Videoseed` | `/lite/videodb`, `/lite/videoseed`; у `VideoDB` `httptimeout` 30 |
+| `VkMovie` | ВКонтакте |
+| `Zetflix` / `ZetflixDB` | Два варианта; `ZetflixDB` идёт через `VideoDB` и требует cookie `wd_approval` в `VideoDB.headers` или Chrome в `VideoDB.cdp` |
+
+## FlixCDN
+
+FlixCDN получает ссылки через официальный плеер в отдельном headed Chromium. Значение глобального параметра `chromium.Headless` не меняется. Браузер запускается только при отсутствии результата в кеше и закрывается после пяти минут простоя.
+
+Включите Chromium и сам источник в `init.conf`:
+
+```json
+{
+  "chromium": {
+    "enable": true
+  },
+  "FlixCDN": {
+    "enable": true
+  }
+}
+```
+
+<Info>
+  Официальный Docker-образ содержит Chromium и Xvfb. При запуске Lampac без Docker установите Chromium и `/usr/bin/Xvfb` самостоятельно.
+</Info>
+
+Обзор всех групп: [провайдеры](/providers/overview). Платные источники: [OnlinePaid](/providers/paid).

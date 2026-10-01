@@ -36,6 +36,7 @@ public class MusicAlbum
     public string artist_id { get; set; }
     public string artist_name { get; set; }
     public string lookup_query { get; set; }
+    public string lookup_provider { get; set; }
     public int? year { get; set; }
     public string date { get; set; }
     public string type { get; set; }
@@ -57,6 +58,7 @@ public class MusicTrack
     public List<string> artists { get; set; } = new();
     public string album_id { get; set; }
     public string album_title { get; set; }
+    public string isrc { get; set; }
     public int? duration_ms { get; set; }
     public int? track_number { get; set; }
     public int? disc_number { get; set; }
@@ -76,6 +78,7 @@ public class MusicAudioMatch
     public string title { get; set; }
     public List<string> artists { get; set; } = new();
     public string album_title { get; set; }
+    public string isrc { get; set; }
     public int? duration_ms { get; set; }
     public string payload { get; set; }
 
@@ -117,6 +120,8 @@ public class MusicPlaybackSource
     public string proxy_username { get; set; }
     [JsonIgnore]
     public string proxy_password { get; set; }
+    [JsonIgnore]
+    public string proxy_scope { get; set; }
 }
 
 public class MusicAuthState
@@ -256,6 +261,7 @@ public class MusicHomeResponse
 public class MusicPlayResponse
 {
     public bool available { get; set; }
+    public string reason { get; set; }
     public string message { get; set; }
     public string track_id { get; set; }
     public MusicAudioMatch selected_match { get; set; }

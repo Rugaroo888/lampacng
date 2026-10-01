@@ -6,10 +6,9 @@ namespace Music;
 /// «Миксы недели»: каждому дню недели детерминированно назначаются два
 /// артиста из истории прослушиваний профиля + до двух похожих (доминирующие
 /// чужие артисты из SoundCloud related-пулов) — это основа микса. Поверх —
-/// ЕДИНЫЙ слой открытий с общим бюджетом 5 треков (строго additive, в слотах
-/// не анонсируется): приоритет у внешних артистов с Music-Map (по 2 трека),
-/// остаток добирает жанр дня (популярное канонического SC-жанра от совсем
-/// незнакомых артистов); открытия вплетаются в микс равномерно. Seed =
+/// Поверх — additive discovery-слой: Music-Map, SoundCloud-жанры и
+/// Spotify related artists делят до 8 слотов с адаптивными квотами;
+/// открытия вплетаются в микс равномерно. Seed =
 /// profile + ISO-неделя, поэтому внутри дня и недели состав стабилен, а на
 /// следующей неделе раскладка меняется. Сводки по дням — чистый SQL без
 /// внешних HTTP; треки грузятся лениво при открытии микса.
@@ -18,6 +17,7 @@ public static class MusicDailyMixService
 {
     static readonly TimeSpan mixTimeout = TimeSpan.FromSeconds(8);
     static readonly TimeSpan mixCacheTtl = TimeSpan.FromHours(12);
+    static readonly TimeSpan shortMixCacheTtl = TimeSpan.FromMinutes(30);
     const int historyDepth = 150;
     const int ownArtistsPerDay = 2;
     const int minHistoryArtists = 3;
@@ -37,18 +37,23 @@ public static class MusicDailyMixService
     const int maxExternalArtists = 2;
     const int maxRefillExternalArtists = 6;
     const int externalPickWindow = 12;
-    // ЕДИНЫЙ бюджет «открытий» (ревью Codex): Music-Map externals + жанровые
-    // треки делят 5 слотов на микс, приоритет у Music-Map, жанр добирает
-    // остаток; иначе микс рискует стать «слишком не твоим»
-    const int discoveryTrackBudget = 5;
+    // Music-Map + жанр сохраняют свои прежние 5 слотов. Spotify related
+    // получает до 4 слотов, но общий discovery-слой ограничен 8:
+    // источники адаптивно забирают незанятые места, но не вытесняют основу.
+    const int coreDiscoveryTrackBudget = 5;
+    const int discoveryTrackBudget = 8;
+    const int spotifyTrackQuota = 4;
     const int desiredMixTrackCount = 20;
     const int maxMainTracksPerArtist = 4;
     const int maxDiscoveryTracksPerArtist = 2;
     const int externalPoolCandidateLimit = 10;
     const int genreTrackQuota = 4;
     const int genrePoolFetchLimit = 30;
+    const int spotifyFallbackTarget = 16;
+    const int spotifyRelatedArtistLimit = 2;
     static readonly TimeSpan genreCacheTtl = TimeSpan.FromHours(6);
     static readonly TimeSpan artistGenresCacheTtl = TimeSpan.FromDays(14);
+    static readonly TimeSpan spotifyDiscoveryCacheTtl = TimeSpan.FromDays(7);
     // кэш собранных кандидатов недели (история + парс payload всех плейлистов —
     // самая дорогая часть /music/home). Сбор НЕ зависит от недели и salt (они
     // входят только в шаффл), поэтому ключ — профиль; сброс миксов и смена
@@ -57,7 +62,21 @@ public static class MusicDailyMixService
     // импорта плейлиста не должен ждать TTL, чтобы полка появилась)
     static readonly TimeSpan seedCacheTtl = TimeSpan.FromMinutes(12);
     static readonly TimeSpan seedCacheEmptyTtl = TimeSpan.FromSeconds(45);
+    const int seedArtistsCacheCapacity = 256;
     static readonly System.Collections.Concurrent.ConcurrentDictionary<string, (DateTime expiresAt, List<HistoryArtist> artists)> seedArtistsCache = new(StringComparer.Ordinal);
+    // кап жёсткий: чтение lock-free, trim + вставка под общим lock — иначе
+    // параллельные сборы одновременно пройдут проверку Count и вместе её пробьют
+    static readonly object seedArtistsCacheWriteLock = new();
+    // v19-target-20: расширенный discovery-слой не раздувает итог выше целевых 20
+    // v18-spotify-peer: Spotify related участвует во всех миксах с адаптивной квотой 2–4
+    // v17-spotify-buckets: фиты Spotify считаются по primary artist и не обходят cap
+    // v16-spotify-fallback: короткие миксы добираются чистой Spotify
+    // metadata сидов, затем максимум двух related artists, только до 16
+    // v15-short-ttl: миксы короче 16 треков живут в кэше 30m, а не 12h
+    // v14-secondary-genre: один дополнительный жанр добирает только
+    // короткие (<16) миксы; обычные миксы и HTTP-бюджет не меняются
+    // v13-metadata: неразрушающая нормализация + подтверждение Music-Map
+    // external через YouTube author-match либо SoundCloud ISRC
     // v12: основной artist-cap снижен до 4 треков, чтобы якорь не доминировал
     // в 20-трековом миксе; v11: короткие миксы после artist-cap добираются дополнительными
     // Music-Map/genre артистами до ~20 треков без снятия лимитов на артиста;
@@ -67,7 +86,9 @@ public static class MusicDailyMixService
     // v8: artist-pool теперь гейтит кандидатов по запрошенному артисту и
     // канонизирует uploader/channel-имена; v7 — title-prefix нормализация сидов
     // применяется и к истории (YouTube/SC channel/uploader -> реальный Artist - Title)
-    const string cacheVersion = "dailymix-v12";
+    // v20: пересобираем миксы с album_id из Spotify, чтобы playback мог
+    // быстро получить точную длительность без обращения к MusicBrainz.
+    const string cacheVersion = "dailymix-v20-spotify-album-id";
 
     static readonly string[] dayTitles =
     {
@@ -89,6 +110,18 @@ public static class MusicDailyMixService
         public int Count;
         public int FirstIndex;
         public int NoisyCount;
+    }
+
+    sealed class GenrePoolPlan
+    {
+        public List<List<MusicTrack>> PrimaryPools { get; init; } = new();
+        public string SecondaryGenre { get; init; }
+    }
+
+    sealed class SpotifyDiscoveryPlan
+    {
+        public List<SpotifySupport.ArtistDiscoveryResult> SeedDiscoveries { get; init; } = new();
+        public List<List<MusicTrack>> RelatedPools { get; init; } = new();
     }
 
     // кэшируемый payload микса; null из фабрики (слабый результат) не кэшируется
@@ -158,7 +191,8 @@ public static class MusicDailyMixService
                 cacheKey,
                 mixCacheTtl,
                 () => BuildMixAsync(profileId, day, salt, seeds, historyArtists, cancellationToken),
-                cancellationToken);
+                cancellationToken,
+                created => created.tracks.Count < 16 ? shortMixCacheTtl : mixCacheTtl);
         }
         catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
         {
@@ -230,15 +264,27 @@ public static class MusicDailyMixService
 
         var artists = await CollectSeedArtistsAsync(profileId, cancellationToken);
 
-        // редкая уборка протухших записей, чтобы словарь не рос бесконечно
-        if (seedArtistsCache.Count > 256)
-        {
-            foreach (var stale in seedArtistsCache.Where(i => i.Value.expiresAt <= DateTime.UtcNow).ToList())
-                seedArtistsCache.TryRemove(stale.Key, out _);
-        }
-
         var ttl = artists.Count >= minHistoryArtists ? seedCacheTtl : seedCacheEmptyTtl;
-        seedArtistsCache[key] = (DateTime.UtcNow.Add(ttl), new List<HistoryArtist>(artists));
+
+        lock (seedArtistsCacheWriteLock)
+        {
+            if (!seedArtistsCache.ContainsKey(key) && seedArtistsCache.Count >= seedArtistsCacheCapacity)
+            {
+                // сначала протухшие; если их нет — вытесняем с ближайшим истечением,
+                // иначе при равномерном трафике свежие профили переполнят кап
+                foreach (var stale in seedArtistsCache.Where(i => i.Value.expiresAt <= DateTime.UtcNow).ToList())
+                    seedArtistsCache.TryRemove(stale.Key, out _);
+
+                while (seedArtistsCache.Count >= seedArtistsCacheCapacity)
+                {
+                    var oldest = seedArtistsCache.OrderBy(i => i.Value.expiresAt).FirstOrDefault();
+                    if (oldest.Key == null || !seedArtistsCache.TryRemove(oldest.Key, out _))
+                        break;
+                }
+            }
+
+            seedArtistsCache[key] = (DateTime.UtcNow.Add(ttl), new List<HistoryArtist>(artists));
+        }
 
         return artists;
     }
@@ -429,6 +475,7 @@ public static class MusicDailyMixService
             artists = track.artists?.ToList() ?? new List<string>(),
             album_id = track.album_id,
             album_title = track.album_title,
+            isrc = track.isrc,
             duration_ms = track.duration_ms,
             track_number = track.track_number,
             disc_number = track.disc_number,
@@ -509,6 +556,10 @@ public static class MusicDailyMixService
         {
             await Task.WhenAll(artistPoolTasks.Concat(relatedTasks));
         }
+        catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
+        {
+            throw;
+        }
         catch
         {
         }
@@ -534,6 +585,10 @@ public static class MusicDailyMixService
         if (pools.Count == 0)
             return null;
 
+        // сэмплирование внутри дня тоже детерминировано: пул может обновиться
+        // (6h TTL radio-кэша), а микс дня не должен скакать между заходами
+        uint sampleSeed = Fnv1aHash($"{NormalizeProfileKey(profileId)}|{SeedKey(salt)}|{day}|tracks");
+
         // Music-Map — только additive-слой. Запускаем его после проверки, что
         // базовый микс уже есть: так при пустых artist/related-пулах не остаются
         // фоновые HTTP-задачи, а общий 8-секундный бюджет всё равно сохраняется.
@@ -545,11 +600,13 @@ public static class MusicDailyMixService
         // (жанры артистов кэшируются 14d, пул жанра — 6h)
         var genrePoolsTask = SoundCloudSupport.IsDiscoveryEnabled
             ? LoadGenrePoolsAsync(seeds, timeoutCts.Token)
-            : Task.FromResult(new List<List<MusicTrack>>());
+            : Task.FromResult(new GenrePoolPlan());
 
-        // сэмплирование внутри дня тоже детерминировано: пул может обновиться
-        // (6h TTL radio-кэша), а микс дня не должен скакать между заходами
-        uint sampleSeed = Fnv1aHash($"{NormalizeProfileKey(profileId)}|{SeedKey(salt)}|{day}|tracks");
+        // Spotify стартует параллельно с другим discovery. На холодном кэше
+        // это не добавляет последовательную задержку к сборке микса.
+        var spotifyDiscoveryTask = ModInit.conf?.spotify_discovery_enabled == true
+            ? LoadSpotifyDiscoveryPlanAsync(seeds, mixArtists, sampleSeed, timeoutCts.Token)
+            : Task.FromResult(new SpotifyDiscoveryPlan());
 
         for (int i = 0; i < pools.Count; i++)
         {
@@ -591,12 +648,12 @@ public static class MusicDailyMixService
 
             if (externalPools.Count > 0)
                 MusicRadioService.FillRoundRobin(
-                    externalPools, discoveryOutput, discoveryTrackBudget,
+                    externalPools, discoveryOutput, coreDiscoveryTrackBudget,
                     strictNoisyWords, requireCyrillic,
                     excludedIds, excludedKeys, excludedTitles, outputIds, outputKeys, outputTitles,
                     discoveryArtistCounts, maxDiscoveryTracksPerArtist);
 
-            int remaining = Math.Min(discoveryTrackBudget - discoveryOutput.Count, genreTrackQuota);
+            int remaining = Math.Min(coreDiscoveryTrackBudget - discoveryOutput.Count, genreTrackQuota);
 
             if (remaining > 0)
             {
@@ -614,6 +671,25 @@ public static class MusicDailyMixService
                         excludedIds, excludedKeys, excludedTitles, outputIds, outputKeys, outputTitles,
                         discoveryArtistCounts);
             }
+
+            var spotifyPlan = await spotifyDiscoveryTask;
+            int spotifyLimit = Math.Min(
+                discoveryTrackBudget,
+                discoveryOutput.Count + spotifyTrackQuota);
+
+            FillSpotifyRelatedPools(
+                spotifyPlan.RelatedPools,
+                discoveryOutput,
+                spotifyLimit,
+                strictNoisyWords,
+                requireCyrillic,
+                discoveryArtistCounts,
+                excludedIds,
+                excludedKeys,
+                excludedTitles,
+                outputIds,
+                outputKeys,
+                outputTitles);
         }
         catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
         {
@@ -628,7 +704,9 @@ public static class MusicDailyMixService
         MusicRadioService.FillRoundRobin(
             pools,
             output,
-            mixTrackLimit - discoveryOutput.Count,
+            Math.Min(
+                mixTrackLimit - discoveryOutput.Count,
+                desiredMixTrackCount - discoveryOutput.Count),
             seedNoisyWords,
             requireCyrillic,
             excludedIds,
@@ -646,19 +724,52 @@ public static class MusicDailyMixService
 
         if (desiredDiscoveryLimit > discoveryOutput.Count)
         {
-            await RefillShortMixAsync(
-                musicMapTasks,
-                genrePoolsTask,
-                seeds,
-                historyArtists,
-                mixArtists,
-                similars.Select(i => i.name),
-                externalArtists,
+            try
+            {
+                await RefillShortMixAsync(
+                    musicMapTasks,
+                    genrePoolsTask,
+                    seeds,
+                    historyArtists,
+                    mixArtists,
+                    similars.Select(i => i.name),
+                    externalArtists,
+                    sampleSeed,
+                    strictNoisyWords,
+                    requireCyrillic,
+                    discoveryOutput,
+                    desiredDiscoveryLimit,
+                    output.Count,
+                    discoveryArtistCounts,
+                    excludedIds,
+                    excludedKeys,
+                    excludedTitles,
+                    outputIds,
+                    outputKeys,
+                    outputTitles,
+                    genrePools,
+                    timeoutCts.Token);
+            }
+            catch (OperationCanceledException) when (timeoutCts.IsCancellationRequested && !cancellationToken.IsCancellationRequested)
+            {
+                // The discovery budget expired; keep the tracks already collected.
+            }
+        }
+
+        if (ModInit.conf?.spotify_discovery_enabled == true
+            && output.Count + discoveryOutput.Count < spotifyFallbackTarget
+            && desiredDiscoveryLimit > discoveryOutput.Count)
+        {
+            await FillSpotifyFallbackAsync(
+                spotifyDiscoveryTask,
                 sampleSeed,
+                seedNoisyWords,
                 strictNoisyWords,
                 requireCyrillic,
                 discoveryOutput,
                 desiredDiscoveryLimit,
+                output.Count,
+                mainArtistCounts,
                 discoveryArtistCounts,
                 excludedIds,
                 excludedKeys,
@@ -666,9 +777,11 @@ public static class MusicDailyMixService
                 outputIds,
                 outputKeys,
                 outputTitles,
-                genrePools,
-                timeoutCts.Token);
+                timeoutCts.Token,
+                cancellationToken);
         }
+
+        cancellationToken.ThrowIfCancellationRequested();
 
         // открытия вплетаются равномерно, а не хвостом:
         // при 19+5 — позиции 4, 9, 14, 19, 24
@@ -696,7 +809,7 @@ public static class MusicDailyMixService
     // артиста остаются теми же, поэтому микс растёт шириной, а не повтором.
     static async Task RefillShortMixAsync(
         List<Task<List<string>>> musicMapTasks,
-        Task<List<List<MusicTrack>>> genrePoolsTask,
+        Task<GenrePoolPlan> genrePoolsTask,
         List<HistoryArtist> seeds,
         List<HistoryArtist> historyArtists,
         List<string> mixArtists,
@@ -707,6 +820,7 @@ public static class MusicDailyMixService
         bool requireCyrillic,
         List<MusicTrack> discoveryOutput,
         int desiredDiscoveryLimit,
+        int mainTrackCount,
         Dictionary<string, int> discoveryArtistCounts,
         HashSet<string> excludedIds,
         HashSet<string> excludedKeys,
@@ -768,14 +882,32 @@ public static class MusicDailyMixService
                 genrePools = await PrepareGenrePoolsAsync(genrePoolsTask, knownNames, sampleSeed, cancellationToken);
             }
 
-            if (genrePools.Count == 0)
+            if (genrePools.Count > 0)
+                FillDiscoveryFromGenrePools(
+                    genrePools, discoveryOutput, desiredDiscoveryLimit,
+                    strictNoisyWords, requireCyrillic,
+                    excludedIds, excludedKeys, excludedTitles, outputIds, outputKeys, outputTitles,
+                    discoveryArtistCounts);
+
+            if (mainTrackCount + discoveryOutput.Count >= 16
+                || desiredDiscoveryLimit <= discoveryOutput.Count)
                 return;
 
-            FillDiscoveryFromGenrePools(
-                genrePools, discoveryOutput, desiredDiscoveryLimit,
-                strictNoisyWords, requireCyrillic,
-                excludedIds, excludedKeys, excludedTitles, outputIds, outputKeys, outputTitles,
-                discoveryArtistCounts);
+            var secondaryGenrePools = await PrepareGenrePoolsAsync(
+                genrePoolsTask,
+                historyArtists.Select(i => i.Name)
+                    .Concat(mixArtists)
+                    .Concat(selectedExternalArtists),
+                sampleSeed + 0x6A09E667,
+                cancellationToken,
+                secondary: true);
+
+            if (secondaryGenrePools.Count > 0)
+                FillDiscoveryFromGenrePools(
+                    secondaryGenrePools, discoveryOutput, desiredDiscoveryLimit,
+                    strictNoisyWords, requireCyrillic,
+                    excludedIds, excludedKeys, excludedTitles, outputIds, outputKeys, outputTitles,
+                    discoveryArtistCounts);
         }
         catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
         {
@@ -794,7 +926,7 @@ public static class MusicDailyMixService
     static async Task<List<List<MusicTrack>>> LoadExternalArtistPoolsAsync(List<string> artists, CancellationToken cancellationToken)
     {
         var poolTasks = artists
-            .Select(artist => MusicRadioService.LoadArtistPoolAsync(artist, cancellationToken))
+            .Select(artist => MusicRadioService.LoadArtistPoolAsync(artist, cancellationToken, requireConfirmedArtist: true))
             .ToList();
 
         try
@@ -811,6 +943,249 @@ public static class MusicDailyMixService
             .Where(pool => pool.Count > 0)
             .Select(pool => pool.Take(externalPoolCandidateLimit).ToList())
             .ToList();
+    }
+
+    static async Task FillSpotifyFallbackAsync(
+        Task<SpotifyDiscoveryPlan> spotifyDiscoveryTask,
+        uint sampleSeed,
+        HashSet<string> seedNoisyWords,
+        HashSet<string> strictNoisyWords,
+        bool requireCyrillic,
+        List<MusicTrack> discoveryOutput,
+        int desiredDiscoveryLimit,
+        int mainTrackCount,
+        Dictionary<string, int> mainArtistCounts,
+        Dictionary<string, int> discoveryArtistCounts,
+        HashSet<string> excludedIds,
+        HashSet<string> excludedKeys,
+        HashSet<string> excludedTitles,
+        HashSet<string> outputIds,
+        HashSet<string> outputKeys,
+        HashSet<string> outputTitles,
+        CancellationToken budgetToken,
+        CancellationToken cancellationToken)
+    {
+        int missing = spotifyFallbackTarget - mainTrackCount - discoveryOutput.Count;
+        if (missing <= 0)
+            return;
+
+        int target = Math.Min(desiredDiscoveryLimit, discoveryOutput.Count + missing);
+
+        try
+        {
+            cancellationToken.ThrowIfCancellationRequested();
+            // A completed plan is still useful after expiry, but no new discovery
+            // request or extra timeout is allowed for the fallback.
+            var plan = spotifyDiscoveryTask.IsCompletedSuccessfully
+                ? spotifyDiscoveryTask.Result
+                : await spotifyDiscoveryTask.WaitAsync(budgetToken);
+            cancellationToken.ThrowIfCancellationRequested();
+            if (plan == null)
+                return;
+
+            var seedDiscoveries = plan.SeedDiscoveries;
+
+            var seedPools = seedDiscoveries
+                .Select(item => item.top_tracks
+                    .Select(MusicRadioService.NormalizeCandidateMetadata)
+                    .Where(track => track != null)
+                    .ToList())
+                .Where(pool => pool.Count > 0)
+                .ToList();
+
+            for (int i = 0; i < seedPools.Count; i++)
+                ShuffleDeterministic(seedPools[i], sampleSeed + 0x3C6EF372 + (uint)i);
+
+            if (seedPools.Count > 0)
+            {
+                MusicRadioService.FillRoundRobin(
+                    seedPools, discoveryOutput, target,
+                    seedNoisyWords, requireCyrillic,
+                    excludedIds, excludedKeys, excludedTitles, outputIds, outputKeys, outputTitles,
+                    mainArtistCounts, maxMainTracksPerArtist);
+
+                if (mainTrackCount + discoveryOutput.Count < spotifyFallbackTarget && requireCyrillic)
+                    MusicRadioService.FillRoundRobin(
+                        seedPools, discoveryOutput, target,
+                        seedNoisyWords, false,
+                        excludedIds, excludedKeys, excludedTitles, outputIds, outputKeys, outputTitles,
+                        mainArtistCounts, maxMainTracksPerArtist);
+            }
+
+            if (mainTrackCount + discoveryOutput.Count >= spotifyFallbackTarget
+                || discoveryOutput.Count >= target)
+                return;
+
+            FillSpotifyRelatedPools(
+                plan.RelatedPools,
+                discoveryOutput,
+                target,
+                strictNoisyWords,
+                requireCyrillic,
+                discoveryArtistCounts,
+                excludedIds,
+                excludedKeys,
+                excludedTitles,
+                outputIds,
+                outputKeys,
+                outputTitles);
+        }
+        catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
+        {
+            throw;
+        }
+        catch
+        {
+        }
+    }
+
+    static async Task<SpotifyDiscoveryPlan> LoadSpotifyDiscoveryPlanAsync(
+        List<HistoryArtist> seeds,
+        IEnumerable<string> mixArtists,
+        uint sampleSeed,
+        CancellationToken cancellationToken)
+    {
+        var seedTasks = seeds.Select(seed => LoadSpotifyArtistDiscoveryByNameAsync(seed.Name, cancellationToken)).ToList();
+
+        try
+        {
+            await Task.WhenAll(seedTasks);
+        }
+        catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
+        {
+            throw;
+        }
+        catch
+        {
+        }
+
+        var seedDiscoveries = seedTasks
+            .Where(task => task.IsCompletedSuccessfully && task.Result != null)
+            .Select(task => task.Result)
+            .ToList();
+
+        if (seedDiscoveries.Count == 0)
+            return new SpotifyDiscoveryPlan();
+
+        var excludedNames = seeds.Select(seed => seed.Name)
+            .Concat(mixArtists ?? Enumerable.Empty<string>())
+            .Where(name => !string.IsNullOrWhiteSpace(name))
+            .ToList();
+
+        var relatedCandidates = seedDiscoveries
+            .SelectMany(discovery => discovery.related_artists.Select((artist, rank) => new { artist, rank }))
+            .Where(item => item.artist != null
+                && !string.IsNullOrWhiteSpace(item.artist.id)
+                && !string.IsNullOrWhiteSpace(item.artist.name)
+                && !excludedNames.Any(name => MusicMapSupport.IsAliasOf(item.artist.name, name)))
+            .GroupBy(item => MusicRadioService.NormalizeText(item.artist.name), StringComparer.Ordinal)
+            .Where(group => !string.IsNullOrWhiteSpace(group.Key))
+            .Select(group => new
+            {
+                artist = group.First().artist,
+                sources = group.Count(),
+                rank = group.Min(item => item.rank)
+            })
+            .OrderByDescending(item => item.sources)
+            .ThenBy(item => item.rank)
+            .Take(8)
+            .ToList();
+
+        // Совпадение related от обоих сидов важнее позиции в одном списке.
+        // Внутри одинаковой силы порядок зависит от seed дня.
+        ShuffleDeterministic(relatedCandidates, sampleSeed + 0xBB67AE85);
+        var selectedRelated = relatedCandidates
+            .OrderByDescending(item => item.sources)
+            .Take(spotifyRelatedArtistLimit)
+            .Select(item => item.artist)
+            .ToList();
+
+        var relatedTasks = selectedRelated
+            .Select(artist => LoadSpotifyArtistDiscoveryByIdAsync(artist.id, cancellationToken))
+            .ToList();
+
+        try
+        {
+            await Task.WhenAll(relatedTasks);
+        }
+        catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
+        {
+            throw;
+        }
+        catch
+        {
+        }
+
+        var relatedPools = relatedTasks
+            .Where(task => task.IsCompletedSuccessfully && task.Result != null)
+            .Select(task => task.Result.top_tracks
+                .Select(MusicRadioService.NormalizeCandidateMetadata)
+                .Where(track => track != null)
+                .ToList())
+            .Where(pool => pool.Count > 0)
+            .ToList();
+
+        for (int i = 0; i < relatedPools.Count; i++)
+            ShuffleDeterministic(relatedPools[i], sampleSeed + 0xA54FF53A + (uint)i);
+
+        return new SpotifyDiscoveryPlan
+        {
+            SeedDiscoveries = seedDiscoveries,
+            RelatedPools = relatedPools
+        };
+    }
+
+    static void FillSpotifyRelatedPools(
+        List<List<MusicTrack>> relatedPools,
+        List<MusicTrack> discoveryOutput,
+        int limit,
+        HashSet<string> strictNoisyWords,
+        bool requireCyrillic,
+        Dictionary<string, int> discoveryArtistCounts,
+        HashSet<string> excludedIds,
+        HashSet<string> excludedKeys,
+        HashSet<string> excludedTitles,
+        HashSet<string> outputIds,
+        HashSet<string> outputKeys,
+        HashSet<string> outputTitles)
+    {
+        if (relatedPools == null || relatedPools.Count == 0 || discoveryOutput.Count >= limit)
+            return;
+
+        MusicRadioService.FillRoundRobin(
+            relatedPools, discoveryOutput, limit,
+            strictNoisyWords, requireCyrillic,
+            excludedIds, excludedKeys, excludedTitles, outputIds, outputKeys, outputTitles,
+            discoveryArtistCounts, maxDiscoveryTracksPerArtist);
+
+        if (discoveryOutput.Count < limit && requireCyrillic)
+            MusicRadioService.FillRoundRobin(
+                relatedPools, discoveryOutput, limit,
+                strictNoisyWords, false,
+                excludedIds, excludedKeys, excludedTitles, outputIds, outputKeys, outputTitles,
+                discoveryArtistCounts, maxDiscoveryTracksPerArtist);
+    }
+
+    static Task<SpotifySupport.ArtistDiscoveryResult> LoadSpotifyArtistDiscoveryByNameAsync(string artist, CancellationToken cancellationToken)
+    {
+        return MusicMetadataCacheService.GetOrCreateAsync(
+            SpotifySupport.ProviderId,
+            "weekly_artist_discovery",
+            $"artist-name-v2|{MusicRadioService.NormalizeText(artist)}",
+            spotifyDiscoveryCacheTtl,
+            () => SpotifySupport.GetArtistDiscoveryByNameAsync(artist, cancellationToken: cancellationToken),
+            cancellationToken);
+    }
+
+    static Task<SpotifySupport.ArtistDiscoveryResult> LoadSpotifyArtistDiscoveryByIdAsync(string artistId, CancellationToken cancellationToken)
+    {
+        return MusicMetadataCacheService.GetOrCreateAsync(
+            SpotifySupport.ProviderId,
+            "weekly_artist_discovery",
+            $"artist-id-v2|{artistId}",
+            spotifyDiscoveryCacheTtl,
+            () => SpotifySupport.GetArtistDiscoveryAsync(artistId, cancellationToken: cancellationToken),
+            cancellationToken);
     }
 
     // общий для main-заполнения и refill: жанровый слой в два прохода —
@@ -848,16 +1223,33 @@ public static class MusicDailyMixService
     }
 
     static async Task<List<List<MusicTrack>>> PrepareGenrePoolsAsync(
-        Task<List<List<MusicTrack>>> genrePoolsTask,
+        Task<GenrePoolPlan> genrePoolsTask,
         IEnumerable<string> knownNames,
         uint sampleSeed,
-        CancellationToken cancellationToken)
+        CancellationToken cancellationToken,
+        bool secondary = false)
     {
         List<List<MusicTrack>> source;
 
         try
         {
-            source = await genrePoolsTask ?? new List<List<MusicTrack>>();
+            var plan = await genrePoolsTask ?? new GenrePoolPlan();
+
+            if (!secondary)
+            {
+                source = plan.PrimaryPools;
+            }
+            else if (!string.IsNullOrWhiteSpace(plan.SecondaryGenre))
+            {
+                var secondaryPool = await LoadGenrePoolAsync(plan.SecondaryGenre, cancellationToken);
+                source = secondaryPool.Count > 0
+                    ? new List<List<MusicTrack>> { secondaryPool }
+                    : new List<List<MusicTrack>>();
+            }
+            else
+            {
+                source = new List<List<MusicTrack>>();
+            }
         }
         catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
         {
@@ -892,7 +1284,7 @@ public static class MusicDailyMixService
     // жанра (кэш 6h). Жанр берётся только ПРИ УВЕРЕННОСТИ (ревью Codex):
     // явный победитель — один пул; ничья двух сильных жанров (артисты дня
     // из разных миров) — слой делится между обоими; слабый сигнал — слоя нет
-    static async Task<List<List<MusicTrack>>> LoadGenrePoolsAsync(List<HistoryArtist> seeds, CancellationToken cancellationToken)
+    static async Task<GenrePoolPlan> LoadGenrePoolsAsync(List<HistoryArtist> seeds, CancellationToken cancellationToken)
     {
         var genreTasks = seeds.Select(seed => MusicMetadataCacheService.GetOrCreateAsync(
             SoundCloudSupport.DiscoveryProviderId,
@@ -933,7 +1325,7 @@ public static class MusicDailyMixService
 
         // слабый сигнал: жанр не был топ-тегом ни одного артиста (score < 3)
         if (ranked.Count == 0 || ranked[0].Value < 3)
-            return new List<List<MusicTrack>>();
+            return new GenrePoolPlan();
 
         var chosenGenres = new List<string> { ranked[0].Key };
 
@@ -942,13 +1334,15 @@ public static class MusicDailyMixService
         if (ranked.Count > 1 && ranked[1].Value >= 3 && ranked[1].Value * 2 > ranked[0].Value)
             chosenGenres.Add(ranked[1].Key);
 
-        var poolTasks = chosenGenres.Select(genre => MusicMetadataCacheService.GetOrCreateAsync(
-            SoundCloudSupport.DiscoveryProviderId,
-            "genre_tracks",
-            $"genrepool-v1|{genre}",
-            genreCacheTtl,
-            () => SoundCloudSupport.SearchTracksByGenreAsync(genre, genrePoolFetchLimit, cancellationToken),
-            cancellationToken)).ToList();
+        // Пул не грузим заранее: он нужен только если после обычного
+        // добора микс остался короче 16 треков. Берём ровно один следующий
+        // жанр и только при реальном сигнале от сидов (score >= 2).
+        string secondaryGenre = ranked
+            .Where(item => item.Value >= 2 && !chosenGenres.Contains(item.Key, StringComparer.OrdinalIgnoreCase))
+            .Select(item => item.Key)
+            .FirstOrDefault();
+
+        var poolTasks = chosenGenres.Select(genre => LoadGenrePoolAsync(genre, cancellationToken)).ToList();
 
         try
         {
@@ -962,11 +1356,26 @@ public static class MusicDailyMixService
         {
         }
 
-        return poolTasks
-            .Where(task => task.IsCompletedSuccessfully)
-            .Select(task => task.Result ?? new List<MusicTrack>())
-            .Where(pool => pool.Count > 0)
-            .ToList();
+        return new GenrePoolPlan
+        {
+            PrimaryPools = poolTasks
+                .Where(task => task.IsCompletedSuccessfully)
+                .Select(task => task.Result ?? new List<MusicTrack>())
+                .Where(pool => pool.Count > 0)
+                .ToList(),
+            SecondaryGenre = secondaryGenre
+        };
+    }
+
+    static Task<List<MusicTrack>> LoadGenrePoolAsync(string genre, CancellationToken cancellationToken)
+    {
+        return MusicMetadataCacheService.GetOrCreateAsync(
+            SoundCloudSupport.DiscoveryProviderId,
+            "genre_tracks",
+            $"genrepool-v1|{genre}",
+            genreCacheTtl,
+            () => SoundCloudSupport.SearchTracksByGenreAsync(genre, genrePoolFetchLimit, cancellationToken),
+            cancellationToken);
     }
 
     // внешние похожие артисты с Music-Map: пересечение карт обоих сид-артистов
