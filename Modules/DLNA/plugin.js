@@ -637,10 +637,10 @@
 							network.timeout(timeout);
 							network["native"](account(downloadUri), function (result) {
 								//down();
-								Lampa.Bell.push({text: result.status ? 'Добавлено в загрузку' : 'Ошибка при добавление в загрузку'});
+								Lampa.Bell.push({text: result.status ? 'Добавлено в загрузку' : 'Ошибка при добавлении в загрузку'});
 							  }, function () {
 								//down();
-								Lampa.Bell.push({text:'Ошибка при добавление в загрузку'});
+								Lampa.Bell.push({text:'Ошибка при добавлении в загрузку'});
 							  },{},{timeout:timeout});
 						}
 						else if(a.action == 'latest'){
@@ -664,10 +664,10 @@
 									network.timeout(timeout);
 									network["native"](account(downloadUri + '&lastCount=' + c.files), function (result) {
 										//down();
-										Lampa.Bell.push({text: result.status ? 'Добавлено в загрузку' : 'Ошибка при добавление в загрузку'});
+										Lampa.Bell.push({text: result.status ? 'Добавлено в загрузку' : 'Ошибка при добавлении в загрузку'});
 									  }, function () {
 										//down();
-										Lampa.Bell.push({text:'Ошибка при добавление в загрузку'});
+										Lampa.Bell.push({text:'Ошибка при добавлении в загрузку'});
 									  },{},{timeout:timeout});
 								},
 								onBack: function onBack() {
@@ -717,10 +717,10 @@
 									  network.timeout(timeout);
 									  network["native"](account(downloadUri + '&' + select), function (result) {
 										//down();
-										Lampa.Bell.push({text: result.status ? 'Добавлено в загрузку' : 'Ошибка при добавление в загрузку'});
+										Lampa.Bell.push({text: result.status ? 'Добавлено в загрузку' : 'Ошибка при добавлении в загрузку'});
 									  }, function () {
 										//down();
-										Lampa.Bell.push({text:'Ошибка при добавление в загрузку'});
+										Lampa.Bell.push({text:'Ошибка при добавлении в загрузку'});
 									  }, {});
 									}
 									Lampa.Controller.toggle(enabled);
