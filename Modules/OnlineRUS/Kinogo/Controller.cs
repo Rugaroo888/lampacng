@@ -1,17 +1,22 @@
 using Microsoft.AspNetCore.Mvc;
 using Newtonsoft.Json;
+using Newtonsoft.Json.Linq;
 using Shared;
 using Shared.Attributes;
+using Shared.Models;
 using Shared.Models.Base;
 using Shared.Models.Online.Settings;
 using Shared.Models.Templates;
 using Shared.PlaywrightCore;
+using Shared.Services;
 using Shared.Services.HTTP;
 using Shared.Services.RxEnumerate;
 using Shared.Services.Utilities;
 using System;
 using System.Collections.Generic;
 using System.Linq;
+using System.Net.Http;
+using System.Text;
 using System.Text.RegularExpressions;
 using System.Threading.Tasks;
 using System.Web;
@@ -79,6 +84,18 @@ public class KinogoController : BaseOnlineController
         if (string.IsNullOrEmpty(href))
             return OnError("href");
 
+        var embed = await GetEmbed(href);
+        if (!embed.IsSuccess)
+            return OnError(embed.ErrorMsg);
+
+        var cache = await GetPlaylist(href, embed.Value);
+        return ContentTpl(cache,
+            () => BuildResult(cache.Value, title, original_title, year, s, t, rjson, href)
+        );
+    }
+
+    async Task<CacheResult<string>> GetEmbed(string href)
+    {
         #region embed
     reset_embed:
 
@@ -99,7 +116,7 @@ public class KinogoController : BaseOnlineController
                 await PlaywrightHttp.GetSpan(init.plugin, init.cors(targetHref), html =>
                 {
                     iframeUri = Rx.Match(html, "<iframe [^>]+data-src=\"([^\"]+)\"");
-                });
+                }, proxy: proxy_data);
             }
 
             if (iframeUri == null)
@@ -116,28 +133,31 @@ public class KinogoController : BaseOnlineController
         if (IsRhubFallback(embed))
             goto reset_embed;
 
-        if (!embed.IsSuccess)
-            return OnError(embed.ErrorMsg);
+        return embed;
         #endregion
+    }
 
+    async Task<CacheResult<List<PlaylistItem>>> GetPlaylist(string href, string embedUrl)
+    {
         #region iframe
     reset_iframe:
 
-        var cache = await InvokeCacheResult<List<PlaylistItem>>(ipkey($"kinogo:{embed.Value}"), 20, async e =>
+        // v2 keeps old cached entries without id/data out of the playback path.
+        var cache = await InvokeCacheResult<List<PlaylistItem>>(ipkey($"kinogo:playlist:v2:{embedUrl}"), 20, async e =>
         {
             string fileEncode = null;
             var embedHeaders = httpHeaders(init, HeadersModel.Init("referer", $"{init.host}/{href}"));
 
             if (rch?.enable == true)
             {
-                await rch.GetSpan(init.cors(embed.Value), html =>
+                await rch.GetSpan(init.cors(embedUrl), html =>
                 {
                     fileEncode = Rx.Match(html, "\"file\":\"([^\"]+)\"");
                 }, embedHeaders);
             }
             else
             {
-                await PlaywrightHttp.GetSpan(init.plugin, init.cors(embed.Value), html =>
+                await PlaywrightHttp.GetSpan(init.plugin, init.cors(embedUrl), html =>
                 {
                     fileEncode = Rx.Match(html, "\"file\":\"([^\"]+)\"");
                 }, headers: embedHeaders, proxy_data);
@@ -168,16 +188,145 @@ public class KinogoController : BaseOnlineController
             goto reset_iframe;
         #endregion
 
-        return ContentTpl(cache,
-            () => BuildResult(cache.Value, title, original_title, year, s, t, rjson, href)
-        );
+        return cache;
     }
 
+    #region Video
+    [HttpGet, Staticache(manually: true)]
+    [Route("lite/kinogo/video")]
+    [Route("lite/kinogo/video.m3u8")]
+    async public Task<ActionResult> Video(string href, string id, string title, bool play = false)
+    {
+        if (await IsRequestBlocked(rch: true))
+            return badInitMsg;
+
+        if (string.IsNullOrEmpty(href) || string.IsNullOrEmpty(id))
+            return OnError("video params");
+
+        var embed = await GetEmbed(href);
+        if (!embed.IsSuccess)
+            return OnError(embed.ErrorMsg);
+
+        var playlist = await GetPlaylist(href, embed.Value);
+        if (!playlist.IsSuccess)
+            return OnError(playlist.ErrorMsg);
+
+        var item = FindItem(playlist.Value, id);
+        if (string.IsNullOrEmpty(item?.data))
+            return OnError("playlist item");
+
+        if (!Uri.TryCreate(embed.Value, UriKind.Absolute, out var embedUri)
+            || (embedUri.Scheme != "https" && embedUri.Scheme != "http"))
+            return OnError("embed uri");
+
+        string origin = embedUri.GetLeftPart(UriPartial.Authority);
+        var streamHeaders = HeadersModel.Init(("referer", embed.Value), ("origin", origin));
+
+        var cache = await InvokeCacheResult<PlaylistItem>(ipkey($"kinogo:video:v2:{embed.Value}:{id}"), 5, async e =>
+        {
+            // The provider expects the opaque data value as a JSON string.
+            var apiHeaders = httpHeaders(init, HeadersModel.Init(("referer", embed.Value), ("origin", origin), ("content-type", "application/json")));
+            string apiUrl = init.cors($"{origin}/api/playlist/load", apiHeaders, requestInfo);
+            string body = JsonConvert.SerializeObject(item.data);
+            JObject response;
+
+            if (rch?.enable == true)
+                response = await rch.Post<JObject>(apiUrl, body, apiHeaders);
+            else
+            {
+                using var content = new StringContent(body, Encoding.UTF8, "application/json");
+                response = await Http.Post<JObject>(apiUrl, content,
+                    timeoutSeconds: init.httptimeout,
+                    headers: apiHeaders.Where(h => !h.name.Equals("content-type", StringComparison.OrdinalIgnoreCase)).ToList(),
+                    proxy: init.useproxy ? proxy : null, httpversion: init.httpversion);
+            }
+
+            if (response == null || response.Value<bool?>("success") == false)
+                return e.Fail("playlist-load");
+
+            var payload = response["file"] != null ? response : response["data"] as JObject;
+            if (payload == null || payload["file"]?.Type != JTokenType.String)
+                return e.Fail("playlist-load-file");
+
+            var media = payload.ToObject<PlaylistItem>();
+            if (!IsMediaFile(media?.file))
+                return e.Fail("playlist-load-file");
+
+            return e.Success(media);
+        });
+
+        if (!cache.IsSuccess)
+            return OnError(cache.ErrorMsg);
+
+        var streams = new StreamQualityTpl();
+        string file = NormalizeFile(cache.Value.file);
+        foreach (Match match in Regex.Matches(file, "\\[([^\\]]+)\\]((?:https?:)?//[^,\\[\\s]+)"))
+            streams.Append(HostStreamProxy(NormalizeFile(match.Groups[2].Value), headers: streamHeaders), match.Groups[1].Value);
+
+        if (streams.IsEmpty)
+            streams.Append(HostStreamProxy(file, headers: streamHeaders), "auto");
+
+        string stream = streams.Firts().link;
+        if (play)
+            return RedirectToPlay(stream);
+
+        return ContentTo(VideoTpl.ToJson(
+            "play", stream, title ?? item.title,
+            streamquality: streams,
+            subtitles: BuildSubtitles(cache.Value.subtitle ?? item.subtitle, streamHeaders),
+            vast: init.vast,
+            headers: stream.Contains("/proxy/") ? null : streamHeaders,
+            httpContext: HttpContext
+        ));
+    }
+
+    static PlaylistItem FindItem(List<PlaylistItem> playlist, string id)
+    {
+        if (playlist == null)
+            return null;
+
+        foreach (var item in playlist)
+        {
+            if (item.id == id && item.folder == null)
+                return item;
+
+            var found = FindItem(item.folder, id);
+            if (found != null)
+                return found;
+        }
+
+        return null;
+    }
+
+    static string NormalizeFile(string file)
+        => file?.StartsWith("//") == true ? "https:" + file : file;
+
+    static bool IsMediaFile(string file)
+        => !string.IsNullOrWhiteSpace(file) && (file.StartsWith("https://") || file.StartsWith("http://")
+            || file.StartsWith("//") || Regex.IsMatch(file, "^\\[[^\\]]+\\](?:https?:)?//"));
+
+    static bool NeedsLoad(PlaylistItem item)
+        => !string.IsNullOrEmpty(item?.id) && !string.IsNullOrEmpty(item.data);
+
+    string VideoLink(PlaylistItem item, string href, string title)
+        => $"{host}/lite/kinogo/video?href={HttpUtility.UrlEncode(href)}&id={HttpUtility.UrlEncode(item.id)}&title={HttpUtility.UrlEncode(title)}";
+
+    SubtitleTpl BuildSubtitles(string subtitle, IReadOnlyList<HeadersModel> headers = null)
+    {
+        var subtitles = new SubtitleTpl();
+        if (!string.IsNullOrEmpty(subtitle))
+        {
+            foreach (Match match in Regex.Matches(subtitle, "\\[([^\\]]+)\\]([^\\[\\,]+)"))
+                subtitles.Append(match.Groups[1].Value, HostStreamProxy(NormalizeFile(match.Groups[2].Value), headers: headers));
+        }
+        return subtitles;
+    }
+    #endregion
 
     #region BuildResult
     ITplResult BuildResult(List<PlaylistItem> playlist, string title, string original_title, short year, short s, int t, bool rjson, string href)
     {
-        if (!string.IsNullOrEmpty(playlist.FirstOrDefault()?.file))
+        if (playlist.FirstOrDefault()?.folder == null)
         {
             var mtpl = new MovieTpl(title, original_title);
 
@@ -186,8 +335,19 @@ public class KinogoController : BaseOnlineController
                 string voice = source.title;
                 string file = source.file;
 
-                if (string.IsNullOrEmpty(voice) || string.IsNullOrEmpty(file))
+                if (string.IsNullOrEmpty(voice) || (!NeedsLoad(source) && !IsMediaFile(file)))
                     continue;
+
+                if (NeedsLoad(source))
+                {
+                    string link = VideoLink(source, href, $"{title ?? original_title} ({Regex.Replace(voice, "<[^>]+>", "")})");
+                    mtpl.Append(
+                        Regex.Replace(voice, "<[^>]+>", ""), link, "call",
+                        accsArgs($"{link.Replace("/video?", "/video.m3u8?")}&play=true"),
+                        vast: init.vast
+                    );
+                    continue;
+                }
 
                 if (file.StartsWith("//"))
                     file = "https:" + file;
@@ -246,7 +406,9 @@ public class KinogoController : BaseOnlineController
             }
             else
             {
-                var episodes = playlist.First(i => (i.title ?? string.Empty).EndsWith($" {s}")).folder;
+                var episodes = playlist.FirstOrDefault(i => (i.title ?? string.Empty).EndsWith($" {s}"))?.folder;
+                if (episodes == null)
+                    return new EpisodeTpl();
 
                 #region Перевод
                 var vtpl = new VoiceTpl();
@@ -280,10 +442,24 @@ public class KinogoController : BaseOnlineController
                 foreach (var episode in episodes)
                 {
                     string name = episode.title;
-                    string file = episode.folder?.FirstOrDefault(i => i.voice_id == t)?.file;
+                    var source = episode.folder?.FirstOrDefault(i => i.voice_id == t);
+                    string file = source?.file;
 
-                    if (string.IsNullOrEmpty(file))
+                    if (!NeedsLoad(source) && !IsMediaFile(file))
                         continue;
+
+                    if (NeedsLoad(source))
+                    {
+                        string link = VideoLink(source, href, $"{title ?? original_title} ({name}, {source.title})");
+                        etpl.Append(
+                            name, title ?? original_title, s,
+                            Regex.Match(name, " ([0-9]+)$").Groups[1].Value,
+                            link, "call",
+                            streamlink: accsArgs($"{link.Replace("/video?", "/video.m3u8?")}&play=true"),
+                            vast: init.vast
+                        );
+                        continue;
+                    }
 
                     if (file.StartsWith("//"))
                         file = "https:" + file;
