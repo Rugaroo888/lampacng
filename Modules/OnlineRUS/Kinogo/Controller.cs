@@ -321,6 +321,9 @@ public class KinogoController : BaseOnlineController
         }
         return subtitles;
     }
+
+    static string VoiceName(PlaylistItem item)
+        => HttpUtility.HtmlDecode(Regex.Replace(item?.title ?? string.Empty, "<[^>]+>", "")).Trim();
     #endregion
 
     #region BuildResult
@@ -413,6 +416,13 @@ public class KinogoController : BaseOnlineController
                 #region Перевод
                 var vtpl = new VoiceTpl();
                 var hashSet = new HashSet<int>();
+                var voiceIds = new Dictionary<string, int>(StringComparer.Ordinal);
+                var reservedIds = new HashSet<int>(episodes
+                    .Where(i => i.folder != null)
+                    .SelectMany(i => i.folder)
+                    .Where(i => i != null)
+                    .Select(i => i.voice_id));
+                int nextVoiceId = 0;
 
                 foreach (var episode in episodes)
                 {
@@ -421,18 +431,31 @@ public class KinogoController : BaseOnlineController
 
                     foreach (var voice in episode.folder)
                     {
-                        int voice_id = voice.voice_id;
-                        if (hashSet.Add(voice_id))
-                        {
-                            if (t == -1)
-                                t = voice_id;
+                        string voiceName = VoiceName(voice);
+                        if (string.IsNullOrEmpty(voiceName) || voiceIds.ContainsKey(voiceName)
+                            || (!NeedsLoad(voice) && !IsMediaFile(voice?.file)))
+                            continue;
 
-                            vtpl.Append(
-                                voice.title,
-                                t == voice_id,
-                                $"{host}/lite/kinogo?rjson={rjson}&title={enc_title}&original_title={enc_original_title}&year={year}&href={enc_href}&s={s}&t={voice_id}"
-                            );
+                        int voice_id = voice.voice_id;
+                        // New playlists omit voice_id. Keep legacy ids and distinguish
+                        // missing or duplicated ids by the label, consistently across episodes.
+                        if (voice_id < 0 || hashSet.Contains(voice_id))
+                        {
+                            while (reservedIds.Contains(nextVoiceId) || hashSet.Contains(nextVoiceId))
+                                nextVoiceId++;
+                            voice_id = nextVoiceId++;
                         }
+
+                        voiceIds.Add(voiceName, voice_id);
+                        hashSet.Add(voice_id);
+                        if (t == -1)
+                            t = voice_id;
+
+                        vtpl.Append(
+                            voiceName,
+                            t == voice_id,
+                            $"{host}/lite/kinogo?rjson={rjson}&title={enc_title}&original_title={enc_original_title}&year={year}&href={enc_href}&s={s}&t={voice_id}"
+                        );
                     }
                 }
                 #endregion
@@ -442,7 +465,9 @@ public class KinogoController : BaseOnlineController
                 foreach (var episode in episodes)
                 {
                     string name = episode.title;
-                    var source = episode.folder?.FirstOrDefault(i => i.voice_id == t);
+                    var source = episode.folder?.FirstOrDefault(i =>
+                        voiceIds.TryGetValue(VoiceName(i), out int voice_id) && voice_id == t
+                        && (NeedsLoad(i) || IsMediaFile(i?.file)));
                     string file = source?.file;
 
                     if (!NeedsLoad(source) && !IsMediaFile(file))
@@ -456,6 +481,7 @@ public class KinogoController : BaseOnlineController
                             Regex.Match(name, " ([0-9]+)$").Groups[1].Value,
                             link, "call",
                             streamlink: accsArgs($"{link.Replace("/video?", "/video.m3u8?")}&play=true"),
+                            voice_name: VoiceName(source),
                             vast: init.vast
                         );
                         continue;
@@ -490,6 +516,7 @@ public class KinogoController : BaseOnlineController
                         Regex.Match(name, " ([0-9]+)$").Groups[1].Value,
                         HostStreamProxy(file),
                         subtitles: subtitles,
+                        voice_name: VoiceName(source),
                         vast: init.vast
                     );
                 }
