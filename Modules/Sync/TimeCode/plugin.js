@@ -58,6 +58,9 @@
       value: function init() {
         var _this = this;
         Lampa.Timeline.listener.follow('update', this.add.bind(this));
+        if (Lampa.Player && Lampa.Player.listener) {
+          Lampa.Player.listener.follow('create', function(e) { _this.rememberPlayback(e && e.data); });
+        }
         Lampa.Listener.follow('full', function(e) {
           if (e.type == 'complite') {
             _this.update();
@@ -236,7 +239,9 @@
         try { ready = (Lampa.Account.Bookmarks.all() || []).length; } catch (e) {}
         if (!ready) ready = ((Lampa.Storage.get('favorite', {}) || {}).card || []).length;
 
-        if (ready) return this.migrate();
+        // Метаданные позволяют восстановить прогресс ещё до загрузки закладок.
+        if (ready || attempt === 0) this.migrate();
+        if (ready) return;
         if (attempt > 30) return;
 
         // Никто не запросил — запрашиваем сами, но один раз.
@@ -248,14 +253,17 @@
       key: "migrate",
       value: function migrate() {
         var _this4 = this;
-        if (window.lampac_timecode_migrated) return;
+        var revision = JSON.stringify(this.cards());
+        if (window.lampac_timecode_migrated && this.migrationRevision === revision) return;
         window.lampac_timecode_migrated = true;
+        this.migrationRevision = revision;
         var scope = this.exportScope();
         this.network.silent(this.apiUrl('dump'), function(dump) {
           if (_this4.exportScope() !== scope) return;
           var known = {};
           ((dump && dump.rows) || []).forEach(function(row) {
             if (row.hash) known[row.hash] = row;
+            if (row.id) known[row.id] = row;
           });
           _this4.resolve(known);
           _this4.flushPending();
@@ -265,8 +273,8 @@
       /**
        * Опознать отметки, которые лежат локально без идентичности.
        *
-       * Кубовый дамп приходит одними хешами и оседает в localStorage мимо Timeline.update, так что
-       * до сервера не доезжает вовсе. Хеш необратим, но обратимо обратное: у закладок есть карточки
+       * Дамп оседает в localStorage мимо Timeline.update. Сначала используем card/season/episode,
+       * а старые записи узнаём по закладкам. Хеш необратим, но обратимо обратное: у закладок есть карточки
        * с оригинальными названиями, а хеш считается ровно из них. Перебираем закладки, считаем их
        * хеши и смотрим, какие из них лежат в file_view.
        */
@@ -274,12 +282,24 @@
       value: function resolve(known) {
         var viewed = Lampa.Storage.cache(this.filename(), 10000, {});
         var index = this.cards();
-        if (!index.length) return;
-
         var claims = {};
+        var linked = {};
+        var knownById = {};
+        var legacy = false;
+
+        for (var key in known) {
+          if (known[key].id) knownById[known[key].id] = known[key];
+        }
+        for (var localHash in viewed) {
+          var direct = this.identifyMetadata(viewed[localHash]);
+          if (direct) {
+            linked[localHash] = direct;
+            claims[localHash] = [direct];
+          } else legacy = true;
+        }
 
         function claim(hash, identity, card) {
-          if (!viewed[hash]) return;
+          if (!viewed[hash] || linked[hash]) return;
           if (!claims[hash]) claims[hash] = [];
           for (var i = 0; i < claims[hash].length; i++) {
             if (claims[hash][i].identity === identity) return;
@@ -287,7 +307,7 @@
           claims[hash].push({ identity: identity, card: card });
         }
 
-        index.forEach(function(entry) {
+        if (legacy) index.forEach(function(entry) {
           if (entry.t === 'tv') {
             // Настоящее число сезонов, когда закладка его несёт: перебор уже точный.
             var seasons = entry.s > 0 ? Math.min(entry.s + 1, 60) : 50;
@@ -310,11 +330,13 @@
 
         for (var hash in claims) {
           // У сервера уже есть идентичность — чужую версию не навязываем.
-          if (known[hash] && known[hash].id) {
+          // После смены названия хеш может измениться, а идентичность остаётся прежней.
+          var remote = (linked[hash] && knownById[linked[hash].identity]) || known[hash];
+          if (remote && remote.id) {
             var local = viewed[hash];
-            var identified = this.identify(hash);
-            if (!known[hash].deleted && Number(local.updated) > Number(known[hash].watched_at || 0) &&
-                identified && identified.identity === known[hash].id && identified.card === known[hash].card) {
+            var identified = linked[hash] || this.identify(hash, local);
+            if (!remote.deleted && Number(local.updated) > Number(remote.watched_at || 0) &&
+                identified && identified.identity === remote.id && identified.card === remote.card) {
               // Восстанавливаем свежий локальный прогресс, оставшийся от клиента без очереди.
               this.add({data: {hash: hash, road: local}});
             }
@@ -353,7 +375,7 @@
 
         console.log('Lampac TimeCode', 'cards=' + index.length,
           'local=' + Object.keys(viewed).length, 'claimed=' + Object.keys(claims).length,
-          'shared=' + ambiguous, 'rows=' + rows.length);
+          'metadata=' + Object.keys(linked).length, 'shared=' + ambiguous, 'rows=' + rows.length);
 
         if (!rows.length) return;
 
@@ -371,13 +393,34 @@
         })(0);
       }
     }, {
+      /** Сохранить исходные привязки до передачи плейлиста нативному плееру. */
+      key: "rememberPlayback",
+      value: function rememberPlayback(data) {
+        if (!data) return;
+        var links = {};
+        var items = [data].concat(Array.isArray(data.playlist) ? data.playlist : []);
+        for (var i = 0; i < items.length; i++) {
+          var road = items[i] && items[i].timeline;
+          if (!road || !road.hash || typeof road.card !== 'string') continue;
+          var card = /^(?:[a-z0-9_]+_)?(movie|tv)_(\d+)$/.exec(road.card);
+          if (!card) continue;
+          var found = this.identifyMetadata({ card: card[1] + '_' + card[2], season: road.season, episode: road.episode });
+          if (!found) continue;
+          if (!Object.prototype.hasOwnProperty.call(links, String(road.hash))) {
+            links[String(road.hash)] = JSON.parse(timelineExtra(road, found.card));
+          }
+        }
+        // Старый APK возвращает Timeline.update без метаданных. Храним привязки текущего
+        // плейлиста отдельно от прогресса, чтобы пережить пересоздание WebView без сброса позиции.
+        var playback = Lampa.Storage.get('lampac_timecode_playback_v1', {});
+        playback[this.exportScope()] = links;
+        Lampa.Storage.set('lampac_timecode_playback_v1', playback, true);
+      }
+    }, {
       /**
-       * Записать отметку.
-       *
-       * Карточку берём не из текущей активности: дельта из куба прилетает фоном, когда открыта
-       * Главная, и строка легла бы под `0_movie`. Пишем только тогда, когда карточка установлена —
-       * либо открытая страница объясняет этот хеш, либо он уже опознан разбором. Всё остальное
-       * лежит в localStorage и доедет следующим разбором, так что ничего не теряется.
+       * Сохраняем снимок до HTTP-запроса. Карточку определяем по метаданным Timeline, а для
+       * старых записей проверяем хеш по открытой карточке и закладкам. Неопознанные отметки
+       * остаются в очереди до появления данных для распознавания.
        */
       key: "add",
       value: function add(e) {
@@ -388,8 +431,17 @@
         ['time', 'duration', 'percent', 'profile', 'updated', 'card', 'season', 'episode'].forEach(function(key) {
           if (typeof road[key] == 'number' || typeof road[key] == 'string') saved[key] = road[key];
         });
-        var outbox = Lampa.Storage.get('lampac_timecode_outbox_v1', {});
         var scope = this.exportScope();
+        if (!saved.card) {
+          var playback = Lampa.Storage.get('lampac_timecode_playback_v1', {});
+          var link = (playback[scope] || {})[hash];
+          if (link) {
+            saved.card = link.card;
+            if (link.season !== undefined) saved.season = link.season;
+            if (link.episode !== undefined) saved.episode = link.episode;
+          }
+        }
+        var outbox = Lampa.Storage.get('lampac_timecode_outbox_v1', {});
         if (!outbox[scope]) outbox[scope] = {};
         var previous = outbox[scope][hash];
         if (!previous || !(Number(previous.updated) > Number(saved.updated || 0))) outbox[scope][hash] = saved;
@@ -418,7 +470,7 @@
         for (var hash in pending) {
           if (!Object.prototype.hasOwnProperty.call(pending, hash)) continue;
           var road = pending[hash];
-          var found = this.identify(hash);
+          var found = this.identify(hash, road);
           if (!found) {
             if (!this.exportUnknown) this.exportUnknown = {};
             if (!this.exportUnknown[hash]) console.warn('Lampac TimeCode', 'export waiting for card', 'hash=' + hash);
@@ -535,13 +587,37 @@
       /**
        * Чей это хеш.
        *
-       * Сначала открытая карточка — она объясняет ЛОКАЛЬНЫЙ просмотр и стоит почти ничего.
+       * Сначала метаданные Timeline: они не зависят от названия, хеша и загрузки закладок.
+       * Затем открытая карточка — она объясняет ЛОКАЛЬНЫЙ просмотр и стоит почти ничего.
        * Если не объяснила, значит отметка пришла извне: кто-то посмотрел на другом устройстве,
        * куб прислал дельту, и к открытой странице она отношения не имеет. Тогда ищем среди
        * закладок — тем же перебором, что и разовый разбор.
        */
+      key: "identifyMetadata",
+      value: function identifyMetadata(road) {
+        if (!road || typeof road.card !== 'string') return null;
+        // У других каталогов свои ID: не смешиваем их с общей областью TMDB/CUB.
+        var link = /^(?:(?:tmdb|cub)_)?(movie|tv)_([1-9]\d*)$/.exec(road.card);
+        if (!link || Number(link[2]) > 9007199254740991) return null;
+        var identity = link[1] + '-' + link[2];
+        if (link[1] === 'tv') {
+          var season = road.season;
+          var episode = road.episode;
+          if ((typeof season !== 'number' && typeof season !== 'string') ||
+              (typeof episode !== 'number' && typeof episode !== 'string')) return null;
+          if (!/^\d+$/.test(String(season)) || !/^\d+$/.test(String(episode))) return null;
+          season = Number(season);
+          episode = Number(episode);
+          if (season > 9007199254740991 || episode < 1 || episode > 9007199254740991) return null;
+          identity += '-s' + season + 'e' + episode;
+        }
+        return { identity: identity, card: link[2] + '_' + link[1] };
+      }
+    }, {
       key: "identify",
-      value: function identify(hash) {
+      value: function identify(hash, road) {
+        var metadata = this.identifyMetadata(road);
+        if (metadata) return metadata;
         hash = String(hash);
         // Открытую карточку можно смотреть до её появления в закладках.
         var activity = Lampa.Storage.get('activity', '{}');
