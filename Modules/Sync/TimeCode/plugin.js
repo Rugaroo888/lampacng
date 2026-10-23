@@ -59,7 +59,10 @@
         var _this = this;
         Lampa.Timeline.listener.follow('update', this.add.bind(this));
         Lampa.Listener.follow('full', function(e) {
-          if (e.type == 'complite') _this.update();
+          if (e.type == 'complite') {
+            _this.update();
+            _this.flushPending();
+          }
         });
 		Lampa.Listener.follow('lampac', function(e) {
           if (e.type == 'timecode_pullFromServer') _this.update();
@@ -68,7 +71,10 @@
         // поэтому своё же эхо здесь не приходит и цикла записи нет.
         document.addEventListener('lwsEvent', function(e) {
           if (e.detail && e.detail.name == 'timecode') _this.update();
-          else if (e.detail && e.detail.name == 'system' && e.detail.data == 'reconnected') _this.update();
+          else if (e.detail && e.detail.name == 'system' && e.detail.data == 'reconnected') {
+            _this.update();
+            _this.flushPending();
+          }
         });
 
         _this.awaitBookmarks(0);
@@ -80,7 +86,14 @@
             window.lampac_timecode_migrated = false;
             _this.awaitBookmarks(0);
           }
+          if (e.name == 'account' || e.name == 'account_bookmarks' || e.name == 'favorite' || e.name == 'lampac_profile_id') {
+            _this.flushPending();
+          }
         });
+        document.addEventListener('visibilitychange', function() {
+          if (!document.hidden) _this.flushPending();
+        });
+        setTimeout(function() { _this.flushPending(); }, 2000);
       }
     }, {
       /**
@@ -237,13 +250,15 @@
         var _this4 = this;
         if (window.lampac_timecode_migrated) return;
         window.lampac_timecode_migrated = true;
-
+        var scope = this.exportScope();
         this.network.silent(this.apiUrl('dump'), function(dump) {
+          if (_this4.exportScope() !== scope) return;
           var known = {};
           ((dump && dump.rows) || []).forEach(function(row) {
             if (row.hash) known[row.hash] = row;
           });
           _this4.resolve(known);
+          _this4.flushPending();
         }, function() {});
       }
     }, {
@@ -295,7 +310,16 @@
 
         for (var hash in claims) {
           // У сервера уже есть идентичность — чужую версию не навязываем.
-          if (known[hash] && known[hash].id) continue;
+          if (known[hash] && known[hash].id) {
+            var local = viewed[hash];
+            var identified = this.identify(hash);
+            if (!known[hash].deleted && Number(local.updated) > Number(known[hash].watched_at || 0) &&
+                identified && identified.identity === known[hash].id && identified.card === known[hash].card) {
+              // Восстанавливаем свежий локальный прогресс, оставшийся от клиента без очереди.
+              this.add({data: {hash: hash, road: local}});
+            }
+            continue;
+          }
 
           // Один хеш достаётся двум одноимённым работам, и куб, ключующийся только хешем, хранит
           // на них ОДНУ строку. У лампака ключ — (пользователь, карточка, хеш), поэтому каждой
@@ -357,26 +381,100 @@
        */
       key: "add",
       value: function add(e) {
-        var hash = e.data.hash;
+        if (!e || !e.data || !e.data.hash) return;
+        var hash = String(e.data.hash);
         var road = e.data.road || {};
-        var found = this.identify(hash);
-        if (!found) return;
-
-        $.ajax({
-          url: this.apiUrl('set'),
-          type: 'POST',
-          contentType: 'application/json',
-          data: JSON.stringify({ rows: [{
-            id: found.identity,
-            hash: hash,
-            card: found.card,
-            position: road.time || 0,
-            duration: road.duration || 0,
-            percent: road.percent || 0,
-            watched_at: road.updated || 0,
-            extra: timelineExtra(road, found.card)
-          }] })
+        var saved = {};
+        ['time', 'duration', 'percent', 'profile', 'updated', 'card', 'season', 'episode'].forEach(function(key) {
+          if (typeof road[key] == 'number' || typeof road[key] == 'string') saved[key] = road[key];
         });
+        var outbox = Lampa.Storage.get('lampac_timecode_outbox_v1', {});
+        var scope = this.exportScope();
+        if (!outbox[scope]) outbox[scope] = {};
+        var previous = outbox[scope][hash];
+        if (!previous || !(Number(previous.updated) > Number(saved.updated || 0))) outbox[scope][hash] = saved;
+        // Сохраняем до отправки: закрытие WebView может прервать последний запрос.
+        Lampa.Storage.set('lampac_timecode_outbox_v1', outbox, true);
+        this.exportRetries = 0;
+        this.flushPending();
+      }
+    }, {
+      key: "exportScope",
+      value: function exportScope() {
+        var account = Lampa.Storage.get('account', '{}');
+        return JSON.stringify([server_uid || account.email || unic_id, this.profileId()]);
+      }
+    }, {
+      key: "flushPending",
+      value: function flushPending() {
+        if (this.exportBusy) return;
+        clearTimeout(this.exportRetryTimer);
+        var _this6 = this;
+        var scope = this.exportScope();
+        var outbox = Lampa.Storage.get('lampac_timecode_outbox_v1', {});
+        var pending = outbox[scope] || {};
+        var snapshots = {};
+        var rows = [];
+        for (var hash in pending) {
+          if (!Object.prototype.hasOwnProperty.call(pending, hash)) continue;
+          var road = pending[hash];
+          var found = this.identify(hash);
+          if (!found) {
+            if (!this.exportUnknown) this.exportUnknown = {};
+            if (!this.exportUnknown[hash]) console.warn('Lampac TimeCode', 'export waiting for card', 'hash=' + hash);
+            this.exportUnknown[hash] = true;
+            continue;
+          }
+          snapshots[hash] = JSON.stringify(road);
+          rows.push({
+            id: found.identity, hash: hash, card: found.card,
+            position: road.time || 0, duration: road.duration || 0,
+            percent: road.percent || 0, profile: road.profile || 0,
+            watched_at: road.updated || 0, extra: timelineExtra(road, found.card)
+          });
+          if (rows.length >= 200) break;
+        }
+        if (!rows.length) return;
+        var url = this.apiUrl('set');
+        this.exportBusy = true;
+        var finished = false;
+        function finish(ok, status) {
+          if (finished) return;
+          finished = true;
+          _this6.exportBusy = false;
+          if (ok) {
+            // Пока пакет отправлялся, мог появиться более свежий прогресс.
+            var latest = Lampa.Storage.get('lampac_timecode_outbox_v1', {});
+            var remaining = latest[scope] || {};
+            for (var key in snapshots) {
+              if (JSON.stringify(remaining[key]) === snapshots[key]) delete remaining[key];
+            }
+            if (!Object.keys(remaining).length) delete latest[scope];
+            Lampa.Storage.set('lampac_timecode_outbox_v1', latest, true);
+            _this6.exportRetries = 0;
+            _this6.exportRetryTimer = setTimeout(function() { _this6.flushPending(); }, 200);
+          } else {
+            console.warn('Lampac TimeCode', 'export failed; retained locally', 'status=' + (status || 0), 'rows=' + rows.length);
+            _this6.exportRetries = (_this6.exportRetries || 0) + 1;
+            if (_this6.exportScope() !== scope) {
+              _this6.exportRetries = 0;
+              _this6.exportRetryTimer = setTimeout(function() { _this6.flushPending(); }, 200);
+            } else if (_this6.exportRetries <= 2) {
+              _this6.exportRetryTimer = setTimeout(function() { _this6.flushPending(); }, _this6.exportRetries * 2000);
+            }
+          }
+        }
+        try {
+          $.ajax({
+            url: url, type: 'POST', contentType: 'application/json', timeout: 10000,
+            data: JSON.stringify({ rows: rows }),
+            success: function(result) {
+              // Сериализатор сервера пропускает нулевые счётчики.
+              finish(!!(result && result.success === true && Number(result.accepted || 0) + Number(result.skipped || 0) === rows.length), 200);
+            },
+            error: function(xhr) { finish(false, xhr && xhr.status); }
+          });
+        } catch (error) { finish(false, 0); }
       }
     }, {
       /**
@@ -444,9 +542,25 @@
        */
       key: "identify",
       value: function identify(hash) {
-        if (this.misses && this.misses[hash]) return null;
-
+        hash = String(hash);
+        // Открытую карточку можно смотреть до её появления в закладках.
+        var activity = Lampa.Storage.get('activity', '{}');
+        var card = activity.movie || activity.card;
+        if (card && /^\d+$/.test(String(card.id || ''))) {
+          var type = card.name || card.original_name ? 'tv' : 'movie';
+          var original = type === 'tv' ? (card.original_name || card.original_title) : card.original_title;
+          if (original) {
+            var active = this.match(hash, {i: card.id, t: type, o: original, s: card.number_of_seasons || 0});
+            if (active) return active;
+          }
+        }
         var index = this.cards();
+        var revision = JSON.stringify(index);
+        if (revision !== this.cardsRevision) {
+          this.cardsRevision = revision;
+          this.misses = {};
+        }
+        if (this.misses && this.misses[hash]) return null;
         for (var i = 0; i < index.length; i++) {
           var found = this.match(hash, index[i]);
           if (found) return found;
