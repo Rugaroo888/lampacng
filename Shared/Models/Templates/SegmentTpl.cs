@@ -44,7 +44,10 @@ public class SegmentTpl
 
 public class SegmentDto
 {
+    [JsonIgnore(Condition = JsonIgnoreCondition.Never)]
     public int start { get; }
+
+    [JsonIgnore(Condition = JsonIgnoreCondition.Never)]
     public int end { get; }
 
     [JsonConstructor]
