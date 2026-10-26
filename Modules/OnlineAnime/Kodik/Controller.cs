@@ -161,15 +161,14 @@ public class KodikController : BaseOnlineController<ModuleConf>
 
         if (string.IsNullOrWhiteSpace(init.secret_token))
         {
-            var streams = await InvokeCache($"kodik:video:{link}:{play}", 40,
-                () => oninvk.VideoParse(init.playerhost, link),
-                textJson: true
+            var cache = await InvokeCache($"kodik:video:{link}:{play}", 40,
+                () => oninvk.VideoParse(init.playerhost, link)
             );
 
-            if (streams == null)
+            if (cache.streams == null)
                 return OnError();
 
-            string result = oninvk.VideoParse(streams, title, original_title, episode, play, HttpContext, vast: init.vast);
+            string result = oninvk.VideoParse(cache.streams, cache.segments, title, original_title, episode, play, HttpContext, vast: init.vast);
             if (string.IsNullOrEmpty(result))
                 return OnError();
 
