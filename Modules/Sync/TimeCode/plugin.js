@@ -334,11 +334,13 @@
           var remote = (linked[hash] && knownById[linked[hash].identity]) || known[hash];
           if (remote && remote.id) {
             var local = viewed[hash];
-            var identified = linked[hash] || this.identify(hash, local);
-            if (!remote.deleted && Number(local.updated) > Number(remote.watched_at || 0) &&
-                identified && identified.identity === remote.id && identified.card === remote.card) {
-              // Восстанавливаем свежий локальный прогресс, оставшийся от клиента без очереди.
-              this.add({data: {hash: hash, road: local}});
+            // Сначала свежесть: повторный поиск каждой уже сохранённой серии тормозит запуск.
+            if (!remote.deleted && Number(local.updated) > Number(remote.watched_at || 0)) {
+              var identified = linked[hash] || this.identify(hash, local);
+              if (identified && identified.identity === remote.id && identified.card === remote.card) {
+                // Восстанавливаем свежий локальный прогресс, оставшийся от клиента без очереди.
+                this.add({data: {hash: hash, road: local}});
+              }
             }
             continue;
           }
