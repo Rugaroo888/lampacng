@@ -242,7 +242,12 @@ public class KodikController : BaseOnlineController<ModuleConf>
                                         int? s = it.Value<int?>("start");
                                         int? e1 = it.Value<int?>("end");
                                         if (s.HasValue && e1.HasValue)
-                                            segments.ad(s.Value, e1.Value);
+                                        {
+                                            if (segmentkey == "ad")
+                                                segments.ad(s.Value, e1.Value);
+                                            else
+                                                segments.skip(s.Value, e1.Value);
+                                        }
                                     }
                                 }
                             }
