@@ -268,9 +268,7 @@ public struct KodikInvoke
             foreach (var segment in skip_segments.Split(','))
             {
                 var t = segment.Split('-');
-                segments.skips.Add(
-                    new SegmentDto((int)TimeSpan.Parse("00:" + t[0]).TotalSeconds, (int)TimeSpan.Parse("00:" + t[1]).TotalSeconds)
-                );
+                segments.skip((int)TimeSpan.Parse("00:" + t[0]).TotalSeconds, (int)TimeSpan.Parse("00:" + t[1]).TotalSeconds);
             }
         }
 
