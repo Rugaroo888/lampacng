@@ -1486,7 +1486,8 @@
               .append(
                 Lampa.Timeline.render(
                   Lampa.Timeline.view(
-                    Lampa.Utils.hash([season, episode.episode_number, object.movie.original_title].join('')), Lampa.Timeline.link ? Lampa.Timeline.link(object.movie, element.season, element.episode) : null
+                    Lampa.Utils.hash([season, episode.episode_number, object.movie.original_title].join('')),
+					Lampa.Timeline.link ? Lampa.Timeline.link(object.movie, season, episode.episode_number) : null
                   )
                 )
               );
